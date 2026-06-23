@@ -1,0 +1,16 @@
+{
+  "name": "scrape-service",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "bun --hot index.ts",
+    "start": "bun index.ts"
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "docx": "^9.4.1",
+    "sharp": "^0.35.2",
+    "socket.io": "^4.8.3",
+    "z-ai-web-dev-sdk": "^0.0.18"
+  }
+}

@@ -1,0 +1,902 @@
+     1→     1→import { createServer } from 'http';
+     2→     2→import { Server } from 'socket.io';
+     3→     3→import ZAI from 'z-ai-web-dev-sdk';
+     4→     4→import * as cheerio from 'cheerio';
+     5→     5→import {
+     6→     6→  Document, Packer, Paragraph, TextRun, HeadingLevel, ImageRun,
+     7→     7→  AlignmentType, BorderStyle, Table, TableRow, TableCell,
+     8→     8→  WidthType, ShadingType, PageBreak, ExternalHyperlink
+     9→     9→} from 'docx';
+    10→    10→import * as fs from 'fs';
+    11→    11→import * as path from 'path';
+    12→    12→import * as https from 'https';
+    13→    13→import * as http from 'http';
+    14→    14→
+    15→    15→const DOWNLOAD_DIR = '/home/z/my-project/download';
+    16→    16→
+    17→    17→const httpServer = createServer();
+    18→    18→const io = new Server(httpServer, {
+    19→    19→  path: '/',
+    20→    20→  cors: { origin: '*', methods: ['GET', 'POST'] },
+    21→    21→  pingTimeout: 120000,
+    22→    22→  pingInterval: 25000,
+    23→    23→});
+    24→    24→
+    25→    25→// ─── Types ────────────────────────────────────────────────────────────────
+    26→    26→
+    27→    27→interface ScrapedPage {
+    28→    28→  url: string;
+    29→    29→  title: string;
+    30→    30→  sections: ContentSection[];
+    31→    31→  images: ScrapedImage[];
+    32→    32→  formulas: string[];
+    33→    33→  childLinks: string[];
+    34→    34→}
+    35→    35→
+    36→    36→interface ContentSection {
+    37→    37→  type: 'heading' | 'paragraph' | 'code' | 'list' | 'table' | 'image' | 'formula';
+    38→    38→  level?: number;
+    39→    39→  content: string;
+    40→    40→  items?: string[];
+    41→    41→  rows?: string[][];
+    42→    42→  imageData?: Buffer;
+    43→    43→  imageExt?: string;
+    44→    44→}
+    45→    45→
+    46→    46→interface ScrapedImage {
+    47→    47→  url: string;
+    48→    48→  buffer: Buffer;
+    49→    49→  ext: string;
+    50→    50→  alt?: string;
+    51→    51→  order: number;
+    52→    52→}
+    53→    53→
+    54→    54→interface ScrapeProgress {
+    55→    55→  type: 'status' | 'page_done' | 'image_done' | 'error' | 'complete' | 'link_found';
+    56→    56→  message: string;
+    57→    57→  current?: number;
+    58→    58→  total?: number;
+    59→    59→  url?: string;
+    60→    60→  filePath?: string;
+    61→    61→  fileName?: string;
+    62→    62→}
+    63→    63→
+    64→    64→// ─── ZAI SDK Singleton ────────────────────────────────────────────────────
+    65→    65→
+    66→    66→let zaiInstance: Awaited<ReturnType<typeof ZAI.create>> | null = null;
+    67→    67→
+    68→    68→async function getZAI() {
+    69→    69→  if (!zaiInstance) {
+    70→    70→    zaiInstance = await ZAI.create();
+    71→    71→  }
+    72→    72→  return zaiInstance;
+    73→    73→}
+    74→    74→
+    75→    75→// ─── Image Downloader ─────────────────────────────────────────────────────
+    76→    76→
+    77→    77→async function downloadImage(url: string): Promise<{ buffer: Buffer; ext: string } | null> {
+    78→    78→  return new Promise((resolve) => {
+    79→    79→    if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) {
+    80→    80→      resolve(null);
+    81→    81→      return;
+    82→    82→    }
+    83→    83→
+    84→    84→    const client = url.startsWith('https') ? https : http;
+    85→    85→    const timeout = setTimeout(() => {
+    86→    86→      resolve(null);
+    87→    87→    }, 15000);
+    88→    88→
+    89→    89→    const request = client.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+    90→    90→      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+    91→    91→        clearTimeout(timeout);
+    92→    92→        downloadImage(res.headers.location).then(resolve);
+    93→    93→        return;
+    94→    94→      }
+    95→    95→      if (res.statusCode !== 200) {
+    96→    96→        clearTimeout(timeout);
+    97→    97→        resolve(null);
+    98→    98→        return;
+    99→    99→      }
+   100→   100→
+   101→   101→      const chunks: Buffer[] = [];
+   102→   102→      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+   103→   103→      res.on('end', () => {
+   104→   104→        clearTimeout(timeout);
+   105→   105→        const buffer = Buffer.concat(chunks);
+   106→   106→        const contentType = res.headers['content-type'] || '';
+   107→   107→        let ext = '.png';
+   108→   108→        if (contentType.includes('jpeg') || contentType.includes('jpg')) ext = '.jpg';
+   109→   109→        else if (contentType.includes('gif')) ext = '.gif';
+   110→   110→        else if (contentType.includes('webp')) ext = '.webp';
+   111→   111→        else if (contentType.includes('svg')) ext = '.svg';
+   112→   112→        else {
+   113→   113→          // Try to detect from URL
+   114→   114→          const urlExt = path.extname(url).split('?')[0].toLowerCase();
+   115→   115→          if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg'].includes(urlExt)) {
+   116→   116→            ext = urlExt;
+   117→   117→          }
+   118→   118→        }
+   119→   119→        resolve({ buffer, ext });
+   120→   120→      });
+   121→   121→      res.on('error', () => {
+   122→   122→        clearTimeout(timeout);
+   123→   123→        resolve(null);
+   124→   124→      });
+   125→   125→    });
+   126→   126→
+   127→   127→    request.on('error', () => {
+   128→   128→      clearTimeout(timeout);
+   129→   129→      resolve(null);
+   130→   130→    });
+   131→   131→
+   132→   132→    request.setTimeout(15000, () => {
+   133→   133→      request.destroy();
+   134→   134→      clearTimeout(timeout);
+   135→   135→      resolve(null);
+   136→   136→    });
+   137→   137→  });
+   138→   138→}
+   139→   139→
+   140→   140→// ─── Page Scraper ─────────────────────────────────────────────────────────
+   141→   141→
+   142→   142→async function scrapePage(url: string, socket: any, progress: { current: number; total: number }): Promise<ScrapedPage> {
+   143→   143→  const zai = await getZAI();
+   144→   144→
+   145→   145→  socket.emit('progress', {
+   146→   146→    type: 'status',
+   147→   147→    message: `Fetching page: ${url}`,
+   148→   148→    current: progress.current,
+   149→   149→    total: progress.total,
+   150→   150→    url,
+   151→   151→  } as ScrapeProgress);
+   152→   152→
+   153→   153→  const result = await zai.functions.invoke('page_reader', { url });
+   154→   154→
+   155→   155→  if (!result.data || !result.data.html) {
+   156→   156→    throw new Error(`Failed to fetch content from ${url}`);
+   157→   157→  }
+   158→   158→
+   159→   159→  const html = result.data.html;
+   160→   160→  const $ = cheerio.load(html);
+   161→   161→
+   162→   162→  // Extract title
+   163→   163→  const title = result.data.title || $('h1').first().text().trim() || 'Untitled Page';
+   164→   164→
+   165→   165→  const sections: ContentSection[] = [];
+   166→   166→  const images: ScrapedImage[] = [];
+   167→   167→  const formulas: string[] = [];
+   168→   168→  const childLinks: string[] = [];
+   169→   169→  let imageOrder = 0;
+   170→   170→
+   171→   171→  // ─── Extract main content area ──────────────────────────────────────
+   172→   172→  // GeeksforGeeks main content is in .article-content, .content, or entry-content
+   173→   173→  const contentArea = $('.article-content, .content, .entry-content, article, main').first();
+   174→   174→  const root = contentArea.length > 0 ? contentArea : $.root();
+   175→   175→
+   176→   176→  // ─── Extract formulas (MathJax / KaTeX) ─────────────────────────────
+   177→   177→  // MathJax: <script type="math/tex"> or <span class="mathjax">
+   178→   178→  root.find('script[type="math/tex"], script[type="math/tex; mode=display"]').each((_i, el) => {
+   179→   179→    const formula = $(el).html() || '';
+   180→   180→    if (formula.trim()) {
+   181→   181→      formulas.push(formula.trim());
+   182→   182→      const isDisplay = ($(el).attr('type') || '').includes('display');
+   183→   183→      sections.push({
+   184→   184→        type: 'formula',
+   185→   185→        content: formula.trim(),
+   186→   186→      });
+   187→   187→      if (isDisplay) {
+   188→   188→        sections.push({ type: 'paragraph', content: '' });
+   189→   189→      }
+   190→   190→    }
+   191→   191→  });
+   192→   192→
+   193→   193→  // KaTeX: .katex elements - extract the .katex-mathml annotation or .katex-html
+   194→   194→  root.find('.katex-mathml annotation[encoding="application/x-tex"], .katex .katex-mathml annotation').each((_i, el) => {
+   195→   195→    const formula = $(el).text().trim();
+   196→   196→    if (formula && !formulas.includes(formula)) {
+   197→   197→      formulas.push(formula);
+   198→   198→      sections.push({
+   199→   199→        type: 'formula',
+   200→   200→        content: formula,
+   201→   201→      });
+   202→   202→    }
+   203→   203→  });
+   204→   204→
+   205→   205→  // Also look for inline formulas in data attributes or class math
+   206→   206→  root.find('[class*="math"], [class*="formula"], [class*="MathJax"]').each((_i, el) => {
+   207→   207→    const formulaText = $(el).text().trim();
+   208→   208→    if (formulaText.length > 2 && formulaText.length < 500 && /^[^a-zA-Z]*[=+\-×÷∑∫∂√π∞±≤≥<>^_{}]/.test(formulaText)) {
+   209→   209→      if (!formulas.includes(formulaText)) {
+   210→   210→        formulas.push(formulaText);
+   211→   211→        sections.push({ type: 'formula', content: formulaText });
+   212→   212→      }
+   213→   213→    }
+   214→   214→  });
+   215→   215→
+   216→   216→  // ─── Extract images ─────────────────────────────────────────────────
+   217→   217→  // First handle carousel/slider images (GeeksforGeeks uses these extensively)
+   218→   218→  const carouselSelectors = '.carousel-slide img, .slider img, .swiper-slide img, .slick-slide img, [class*="carousel"] img, [class*="slider"] img, .wp-block-image img, .featured-img img, .thumb-item img, .course-item img';
+   219→   219→
+   220→   220→  root.find(carouselSelectors).each((_i, el) => {
+   221→   221→    let src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src') || '';
+   222→   222→    if (src && !src.startsWith('data:')) {
+   223→   223→      if (src.startsWith('//')) src = 'https:' + src;
+   224→   224→      if (src.startsWith('/')) src = new URL(url).origin + src;
+   225→   225→      imageOrder++;
+   226→   226→      images.push({ url: src, buffer: Buffer.alloc(0), ext: '.png', alt: $(el).attr('alt') || '', order: imageOrder });
+   227→   227→      sections.push({ type: 'image', content: src, imageData: Buffer.alloc(0), imageExt: '.png' });
+   228→   228→    }
+   229→   229→  });
+   230→   230→
+   231→   231→  // Then handle regular images in content
+   232→   232→  root.find('img').not(carouselSelectors.replace(/ img/g, '')).each((_i, el) => {
+   233→   233→    let src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src') || '';
+   234→   234→    // Skip tiny icons and emojis
+   235→   235→    const width = parseInt($(el).attr('width') || '0');
+   236→   236→    const height = parseInt($(el).attr('height') || '0');
+   237→   237→    if (!src || src.startsWith('data:') || (width > 0 && width < 30) || (height > 0 && height < 30)) return;
+   238→   238→    if (src.startsWith('//')) src = 'https:' + src;
+   239→   239→    if (src.startsWith('/')) src = new URL(url).origin + src;
+   240→   240→    // Skip tracking pixels and common non-content images
+   241→   241→    if (src.includes('pixel') || src.includes('spacer') || src.includes('1x1')) return;
+   242→   242→    // Avoid duplicates
+   243→   243→    if (images.some(img => img.url === src)) return;
+   244→   244→
+   245→   245→    imageOrder++;
+   246→   246→    images.push({ url: src, buffer: Buffer.alloc(0), ext: '.png', alt: $(el).attr('alt') || '', order: imageOrder });
+   247→   247→    sections.push({ type: 'image', content: src, imageData: Buffer.alloc(0), imageExt: '.png' });
+   248→   248→  });
+   249→   249→
+   250→   250→  // ─── Download images ────────────────────────────────────────────────
+   251→   251→  for (let i = 0; i < images.length; i++) {
+   252→   252→    socket.emit('progress', {
+   253→   253→      type: 'image_done',
+   254→   254→      message: `Downloading image ${i + 1}/${images.length}`,
+   255→   255→      current: i + 1,
+   256→   256→      total: images.length,
+   257→   257→      url: images[i].url,
+   258→   258→    } as ScrapeProgress);
+   259→   259→
+   260→   260→    const downloaded = await downloadImage(images[i].url);
+   261→   261→    if (downloaded) {
+   262→   262→      images[i].buffer = downloaded.buffer;
+   263→   263→      images[i].ext = downloaded.ext;
+   264→   264→      // Update section with actual image data
+   265→   265→      const section = sections.find(s => s.content === images[i].url && s.type === 'image');
+   266→   266→      if (section) {
+   267→   267→        section.imageData = downloaded.buffer;
+   268→   268→        section.imageExt = downloaded.ext;
+   269→   269→      }
+   270→   270→    }
+   271→   271→    // Small delay to avoid rate limiting
+   272→   272→    await new Promise(r => setTimeout(r, 300));
+   273→   273→  }
+   274→   274→
+   275→   275→  // ─── Extract text content structure ─────────────────────────────────
+   276→   276→  // Remove script and style elements for text extraction
+   277→   277→  const contentClone = root.clone();
+   278→   278→  contentClone.find('script, style, nav, footer, header, .sidebar, .navigation, .breadcrumb, .share, .social, .comments, .related, .ad, .advertisement').remove();
+   279→   279→
+   280→   280→  // Walk through the content elements
+   281→   281→  const topElements = contentClone.children();
+   282→   282→  const processedText: Set<string> = new Set();
+   283→   283→
+   284→   284→  async function processElement(el: cheerio.Cheerio<cheerio.Element>, depth: number = 0) {
+   285→   285→    if (depth > 15) return; // Prevent infinite recursion
+   286→   286→
+   287→   287→    const tagName = (el as any).prop('tagName')?.toLowerCase() || '';
+   288→   288→    const text = el.text().trim();
+   289→   289→
+   290→   290→    // Skip empty elements and already processed
+   291→   291→    if (!text && el.children().length === 0) return;
+   292→   292→    if (text.length < 2) return;
+   293→   293→
+   294→   294→    // Headings
+   295→   295→    if (/^h[1-6]$/.test(tagName)) {
+   296→   296→      const level = parseInt(tagName[1]);
+   297→   297→      if (text && !processedText.has(text)) {
+   298→   298→        processedText.add(text);
+   299→   299→        sections.push({ type: 'heading', level, content: text });
+   300→   300→      }
+   301→   301→      return;
+   302→   302→    }
+   303→   303→
+   304→   304→    // Code blocks
+   305→   305→    if (tagName === 'pre' || el.hasClass('code-block') || el.hasClass('highlight') || el.find('code').length > 0 && el.children().length <= 1) {
+   306→   306→      const codeText = el.find('code').text() || el.text();
+   307→   307→      if (codeText.trim() && !processedText.has(codeText.trim())) {
+   308→   308→        processedText.add(codeText.trim());
+   309→   309→        sections.push({ type: 'code', content: codeText.trim().substring(0, 5000) });
+   310→   310→      }
+   311→   311→      return;
+   312→   312→    }
+   313→   313→
+   314→   314→    // Tables
+   315→   315→    if (tagName === 'table') {
+   316→   316→      const rows: string[][] = [];
+   317→   317→      el.find('tr').each((_ri, row) => {
+   318→   318→        const cells: string[] = [];
+   319→   319→        $(row).find('th, td').each((_ci, cell) => {
+   320→   320→          cells.push($(cell).text().trim().replace(/\s+/g, ' '));
+   321→   321→        });
+   322→   322→        if (cells.length > 0) rows.push(cells);
+   323→   323→      });
+   324→   324→      if (rows.length > 0) {
+   325→   325→        const tableKey = rows.map(r => r.join('|')).join('\n');
+   326→   326→        if (!processedText.has(tableKey)) {
+   327→   327→          processedText.add(tableKey);
+   328→   328→          sections.push({ type: 'table', content: '', rows });
+   329→   329→        }
+   330→   330→      }
+   331→   331→      return;
+   332→   332→    }
+   333→   333→
+   334→   334→    // Unordered/Ordered lists
+   335→   335→    if (tagName === 'ul' || tagName === 'ol') {
+   336→   336→      const items: string[] = [];
+   337→   337→      el.find('> li').each((_li, li) => {
+   338→   338→        const itemText = $(li).text().trim().replace(/\s+/g, ' ');
+   339→   339→        if (itemText) items.push(itemText);
+   340→   340→      });
+   341→   341→      if (items.length > 0) {
+   342→   342→        const listKey = items.join('\n');
+   343→   343→        if (!processedText.has(listKey)) {
+   344→   344→          processedText.add(listKey);
+   345→   345→          sections.push({ type: 'list', content: '', items });
+   346→   346→        }
+   347→   347→      }
+   348→   348→      return;
+   349→   349→    }
+   350→   350→
+   351→   351→    // Paragraphs and divs with text content
+   352→   352→    if (tagName === 'p' || (tagName === 'div' && el.children().length === 1 && el.children().first().prop('tagName')?.toLowerCase() === 'p')) {
+   353→   353→      const pText = tagName === 'p' ? text : el.find('p').text().trim();
+   354→   354→      if (pText && pText.length > 10 && !processedText.has(pText)) {
+   355→   355→        processedText.add(pText);
+   356→   356→        sections.push({ type: 'paragraph', content: pText });
+   357→   357→      }
+   358→   358→      return;
+   359→   359→    }
+   360→   360→
+   361→   361→    // For divs/sections, recurse into children
+   362→   362→    if (['div', 'section', 'article', 'main', 'span'].includes(tagName)) {
+   363→   363→      for (const child of el.children().toArray()) {
+   364→   364→        await processElement($(child), depth + 1);
+   365→   365→      }
+   366→   366→      return;
+   367→   367→    }
+   368→   368→  }
+   369→   369→
+   370→   370→  // Process top-level content elements
+   371→   371→  for (const child of topElements.toArray()) {
+   372→   372→    await processElement($(child));
+   373→   373→  }
+   374→   374→
+   375→   375→  // If no sections were extracted from structured parsing, fall back to plain text
+   376→   376→  if (sections.filter(s => ['heading', 'paragraph'].includes(s.type)).length === 0) {
+   377→   377→    const plainText = contentClone.text().replace(/\s+/g, ' ').trim();
+   378→   378→    if (plainText.length > 50) {
+   379→   379→      // Split into paragraphs
+   380→   380→      const paragraphs = plainText.split(/\n\n|\.{3,}|(?<=[.!?])\s+(?=[A-Z])/).filter(p => p.trim().length > 20);
+   381→   381→      for (const p of paragraphs) {
+   382→   382→        if (!processedText.has(p.trim())) {
+   383→   383→          processedText.add(p.trim());
+   384→   384→          sections.push({ type: 'paragraph', content: p.trim() });
+   385→   385→        }
+   386→   386→      }
+   387→   387→    }
+   388→   388→  }
+   389→   389→
+   390→   390→  // ─── Extract child links (related GeeksforGeeks pages) ──────────────
+   391→   391→  const baseUrl = new URL(url);
+   392→   392→  const seenLinks = new Set<string>();
+   393→   393→
+   394→   394→  contentArea.find('a[href]').each((_i, el) => {
+   395→   395→    let href = $(el).attr('href') || '';
+   396→   396→    if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+   397→   397→    if (href.startsWith('//')) href = 'https:' + href;
+   398→   398→    else if (href.startsWith('/')) href = baseUrl.origin + href;
+   399→   399→    try {
+   400→   400→      const linkUrl = new URL(href);
+   401→   401→      // Only follow geeksforgeeks.org links
+   402→   402→      if (linkUrl.hostname.includes('geeksforgeeks.org') && !seenLinks.has(href) && href !== url) {
+   403→   403→        seenLinks.add(href);
+   404→   404→        // Only include article/tutorial links, not category pages
+   405→   405→        const pathParts = linkUrl.pathname.split('/').filter(Boolean);
+   406→   406→        if (pathParts.length >= 2 && !href.match(/\/(courses|practice|company|explore|jobs|contribute)$/)) {
+   407→   407→          childLinks.push(href);
+   408→   408→        }
+   409→   409→      }
+   410→   410→    } catch { /* skip invalid URLs */ }
+   411→   411→  });
+   412→   412→
+   413→   413→  // Limit child links to a reasonable number
+   414→   414→  childLinks.splice(20);
+   415→   415→
+   416→   416→  socket.emit('progress', {
+   417→   417→    type: 'page_done',
+   418→   418→    message: `Completed: ${title}`,
+   419→   419→    url,
+   420→   420→  } as ScrapeProgress);
+   421→   421→
+   422→   422→  return { url, title, sections, images, formulas, childLinks };
+   423→   423→}
+   424→   424→
+   425→   425→// ─── Word Document Generator ──────────────────────────────────────────────
+   426→   426→
+   427→   427→async function generateDocx(pages: ScrapedPage[], fileName: string): Promise<string> {
+   428→   428→  const docSections: (Paragraph | Table)[] = [];
+   429→   429→
+   430→   430→  for (const page of pages) {
+   431→   431→    // Page title as heading
+   432→   432→    docSections.push(
+   433→   433→      new Paragraph({
+   434→   434→        children: [
+   435→   435→          new TextRun({
+   436→   436→            text: page.title,
+   437→   437→            bold: true,
+   438→   438→            size: 36,
+   439→   439→            font: 'Calibri',
+   440→   440→          }),
+   441→   441→        ],
+   442→   442→        heading: HeadingLevel.HEADING_1,
+   443→   443→        spacing: { after: 300 },
+   444→   444→        border: {
+   445→   445→          bottom: { style: BorderStyle.SINGLE, size: 6, color: '333333' },
+   446→   446→        },
+   447→   447→      })
+   448→   448→    );
+   449→   449→
+   450→   450→    // Source URL
+   451→   451→    docSections.push(
+   452→   452→      new Paragraph({
+   453→   453→        children: [
+   454→   454→          new TextRun({
+   455→   455→            text: `Source: ${page.url}`,
+   456→   456→            italics: true,
+   457→   457→            size: 20,
+   458→   458→            color: '666666',
+   459→   459→            font: 'Calibri',
+   460→   460→          }),
+   461→   461→        ],
+   462→   462→        spacing: { after: 200 },
+   463→   463→      })
+   464→   464→    );
+   465→   465→
+   466→   466→    // Process each section
+   467→   467→    for (const section of page.sections) {
+   468→   468→      switch (section.type) {
+   469→   469→        case 'heading': {
+   470→   470→          const headingLevel = section.level
+   471→   471→            ? section.level <= 3 ? section.level as 1 | 2 | 3 : 3
+   472→   472→            : 2;
+   473→   473→          const headingLevels: Record<number, typeof HeadingLevel.HEADING_1> = {
+   474→   474→            1: HeadingLevel.HEADING_1,
+   475→   475→            2: HeadingLevel.HEADING_2,
+   476→   476→            3: HeadingLevel.HEADING_3,
+   477→   477→          };
+   478→   478→          docSections.push(
+   479→   479→            new Paragraph({
+   480→   480→              children: [
+   481→   481→                new TextRun({
+   482→   482→                  text: section.content,
+   483→   483→                  bold: true,
+   484→   484→                  size: headingLevel === 2 ? 28 : headingLevel === 3 ? 24 : 32,
+   485→   485→                  font: 'Calibri',
+   486→   486→                }),
+   487→   487→              ],
+   488→   488→              heading: headingLevels[headingLevel] || HeadingLevel.HEADING_2,
+   489→   489→              spacing: { before: 300, after: 150 },
+   490→   490→            })
+   491→   491→          );
+   492→   492→          break;
+   493→   493→        }
+   494→   494→
+   495→   495→        case 'paragraph': {
+   496→   496→          // Clean up text
+   497→   497→          const cleanText = section.content
+   498→   498→            .replace(/&nbsp;/g, ' ')
+   499→   499→            .replace(/&amp;/g, '&')
+   500→   500→            .replace(/&lt;/g, '<')
+   501→   501→            .replace(/&gt;/g, '>')
+   502→   502→            .replace(/&quot;/g, '"')
+   503→   503→            .replace(/\s+/g, ' ')
+   504→   504→            .trim();
+   505→   505→
+   506→   506→          if (cleanText.length < 3) continue;
+   507→   507→
+   508→   508→          docSections.push(
+   509→   509→            new Paragraph({
+   510→   510→              children: [
+   511→   511→                new TextRun({
+   512→   512→                  text: cleanText,
+   513→   513→                  size: 22,
+   514→   514→                  font: 'Calibri',
+   515→   515→                }),
+   516→   516→              ],
+   517→   517→              spacing: { after: 150, line: 312 },
+   518→   518→              alignment: AlignmentType.LEFT,
+   519→   519→            })
+   520→   520→          );
+   521→   521→          break;
+   522→   522→        }
+   523→   523→
+   524→   524→        case 'formula': {
+   525→   525→          const formulaText = section.content
+   526→   526→            .replace(/&nbsp;/g, ' ')
+   527→   527→            .replace(/\\,/g, ' ')
+   528→   528→            .trim();
+   529→   529→
+   530→   530→          docSections.push(
+   531→   531→            new Paragraph({
+   532→   532→              children: [
+   533→   533→                new TextRun({
+   534→   534→                  text: formulaText,
+   535→   535→                  italics: true,
+   536→   536→                  size: 22,
+   537→   537→                  font: 'Cambria Math',
+   538→   538→                  color: '1a1a2e',
+   539→   539→                }),
+   540→   540→              ],
+   541→   541→              spacing: { before: 200, after: 200, line: 312 },
+   542→   542→              alignment: AlignmentType.CENTER,
+   543→   543→              indent: { left: 720, right: 720 },
+   544→   544→              border: {
+   545→   545→                top: { style: BorderStyle.SINGLE, size: 2, color: 'e0e0e0' },
+   546→   546→                bottom: { style: BorderStyle.SINGLE, size: 2, color: 'e0e0e0' },
+   547→   547→              },
+   548→   548→              shading: {
+   549→   549→                type: ShadingType.CLEAR,
+   550→   550→                fill: 'f8f9fa',
+   551→   551→              },
+   552→   552→            })
+   553→   553→          );
+   554→   554→          break;
+   555→   555→        }
+   556→   556→
+   557→   557→        case 'image': {
+   558→   558→          if (section.imageData && section.imageData.length > 100) {
+   559→   559→            try {
+   560→   560→              docSections.push(
+   561→   561→                new Paragraph({
+   562→   562→                  children: [
+   563→   563→                    new ImageRun({
+   564→   564→                      data: section.imageData,
+   565→   565→                      transformation: {
+   566→   566→                        width: 580,
+   567→   567→                        height: 360,
+   568→   568→                      },
+   569→   569→                      type: section.imageExt === '.jpg' || section.imageExt === '.jpeg' ? 'jpg' : 'png',
+   570→   570→                    }),
+   571→   571→                  ],
+   572→   572→                  spacing: { before: 200, after: 200 },
+   573→   573→                  alignment: AlignmentType.CENTER,
+   574→   574→                })
+   575→   575→              );
+   576→   576→
+   577→   577→              // Image caption if available
+   578→   578→              const img = page.images.find(i => i.url === section.content);
+   579→   579→              if (img?.alt) {
+   580→   580→                docSections.push(
+   581→   581→                  new Paragraph({
+   582→   582→                    children: [
+   583→   583→                      new TextRun({
+   584→   584→                        text: img.alt,
+   585→   585→                        italics: true,
+   586→   586→                        size: 18,
+   587→   587→                        color: '888888',
+   588→   588→                        font: 'Calibri',
+   589→   589→                      }),
+   590→   590→                    ],
+   591→   591→                    spacing: { after: 200 },
+   592→   592→                    alignment: AlignmentType.CENTER,
+   593→   593→                  })
+   594→   594→                );
+   595→   595→              }
+   596→   596→            } catch (imgErr) {
+   597→   597→              console.error('Failed to embed image:', section.content, imgErr);
+   598→   598→            }
+   599→   599→          } else {
+   600→   600→            // Image failed to download - add a placeholder note
+   601→   601→            docSections.push(
+   602→   602→              new Paragraph({
+   603→   603→                children: [
+   604→   604→                  new TextRun({
+   605→   605→                    text: `[Image: ${section.content}]`,
+   606→   606→                    italics: true,
+   607→   607→                    size: 18,
+   608→   608→                    color: '999999',
+   609→   609→                    font: 'Calibri',
+   610→   610→                  }),
+   611→   611→                ],
+   612→   612→                spacing: { after: 100 },
+   613→   613→                alignment: AlignmentType.CENTER,
+   614→   614→              })
+   615→   615→            );
+   616→   616→          }
+   617→   617→          break;
+   618→   618→        }
+   619→   619→
+   620→   620→        case 'code': {
+   621→   621→          const codeLines = section.content.split('\n');
+   622→   622→          // Add code block header
+   623→   623→          docSections.push(
+   624→   624→            new Paragraph({
+   625→   625→              children: [
+   626→   626→                new TextRun({
+   627→   627→                  text: 'Code:',
+   628→   628→                  bold: true,
+   629→   629→                  size: 20,
+   630→   630→                  font: 'Calibri',
+   631→   631→                  color: '555555',
+   632→   632→                }),
+   633→   633→              ],
+   634→   634→              spacing: { before: 100 },
+   635→   635→            })
+   636→   636→          );
+   637→   637→
+   638→   638→          for (const line of codeLines) {
+   639→   639→            docSections.push(
+   640→   640→              new Paragraph({
+   641→   641→                children: [
+   642→   642→                  new TextRun({
+   643→   643→                    text: line || ' ',
+   644→   644→                    size: 18,
+   645→   645→                    font: 'Consolas',
+   646→   646→                  }),
+   647→   647→                ],
+   648→   648→                spacing: { after: 0, line: 240 },
+   649→   649→                indent: { left: 360 },
+   650→   650→                shading: {
+   651→   651→                  type: ShadingType.CLEAR,
+   652→   652→                  fill: 'f5f5f5',
+   653→   653→                },
+   654→   654→              })
+   655→   655→            );
+   656→   656→          }
+   657→   657→          // Spacing after code block
+   658→   658→          docSections.push(new Paragraph({ children: [], spacing: { after: 150 } }));
+   659→   659→          break;
+   660→   660→        }
+   661→   661→
+   662→   662→        case 'list': {
+   663→   663→          if (section.items) {
+   664→   664→            for (const item of section.items) {
+   665→   665→              docSections.push(
+   666→   666→                new Paragraph({
+   667→   667→                  children: [
+   668→   668→                    new TextRun({
+   669→   669→                      text: '\u2022  ' + item,
+   670→   670→                      size: 22,
+   671→   671→                      font: 'Calibri',
+   672→   672→                    }),
+   673→   673→                  ],
+   674→   674→                  spacing: { after: 80, line: 312 },
+   675→   675→                  indent: { left: 360 },
+   676→   676→                })
+   677→   677→              );
+   678→   678→            }
+   679→   679→          }
+   680→   680→          break;
+   681→   681→        }
+   682→   682→
+   683→   683→        case 'table': {
+   684→   684→          if (section.rows && section.rows.length > 0) {
+   685→   685→            const tableRows = section.rows.map((row, rowIndex) => {
+   686→   686→              return new TableRow({
+   687→   687→                tableHeader: rowIndex === 0,
+   688→   688→                children: row.map(cell => {
+   689→   689→                  return new TableCell({
+   690→   690→                    children: [
+   691→   691→                      new Paragraph({
+   692→   692→                        children: [
+   693→   693→                          new TextRun({
+   694→   694→                            text: cell,
+   695→   695→                            bold: rowIndex === 0,
+   696→   696→                            size: 20,
+   697→   697→                            font: 'Calibri',
+   698→   698→                          }),
+   699→   699→                        ],
+   700→   700→                        spacing: { after: 60 },
+   701→   701→                      }),
+   702→   702→                    ],
+   703→   703→                    shading: rowIndex === 0
+   704→   704→                      ? { type: ShadingType.CLEAR, fill: '2d3748', color: 'auto' }
+   705→   705→                      : rowIndex % 2 === 0
+   706→   706→                        ? { type: ShadingType.CLEAR, fill: 'f7fafc', color: 'auto' }
+   707→   707→                        : undefined,
+   708→   708→                    margins: { top: 40, bottom: 40, left: 80, right: 80 },
+   709→   709→                  });
+   710→   710→                }),
+   711→   711→              });
+   712→   712→            });
+   713→   713→
+   714→   714→            docSections.push(
+   715→   715→              new Table({
+   716→   716→                rows: tableRows,
+   717→   717→                width: { size: 100, type: WidthType.PERCENTAGE },
+   718→   718→              })
+   719→   719→            );
+   720→   720→            docSections.push(new Paragraph({ children: [], spacing: { after: 200 } }));
+   721→   721→          }
+   722→   722→          break;
+   723→   723→        }
+   724→   724→      }
+   725→   725→    }
+   726→   726→
+   727→   727→    // Page separator (except after last page)
+   728→   728→    if (pages.indexOf(page) < pages.length - 1) {
+   729→   729→      docSections.push(
+   730→   730→        new Paragraph({
+   731→   731→          children: [new PageBreak()],
+   732→   732→        })
+   733→   733→      );
+   734→   734→    }
+   735→   735→  }
+   736→   736→
+   737→   737→  // Create the document
+   738→   738→  const doc = new Document({
+   739→   739→    sections: [
+   740→   740→      {
+   741→   741→        properties: {
+   742→   742→          page: {
+   743→   743→            margin: { top: 720, bottom: 720, left: 720, right: 720 },
+   744→   744→          },
+   745→   745→        },
+   746→   746→        children: docSections,
+   747→   747→      },
+   748→   748→    ],
+   749→   749→  });
+   750→   750→
+   751→   751→  // Save to file
+   752→   752→  const filePath = path.join(DOWNLOAD_DIR, fileName);
+   753→   753→  const buffer = await Packer.toBuffer(doc);
+   754→   754→  fs.writeFileSync(filePath, buffer);
+   755→   755→
+   756→   756→  return filePath;
+   757→   757→}
+   758→   758→
+   759→   759→// ─── Main Scraping Orchestrator ───────────────────────────────────────────
+   760→   760→
+   761→   761→async function orchestrateScrape(
+   762→   762→  startUrl: string,
+   763→   763→  depth: number,
+   764→   764→  followLinks: boolean,
+   765→   765→  socket: any,
+   766→   766→  sessionId: string
+   767→   767→) {
+   768→   768→  const visitedUrls = new Set<string>();
+   769→   769→  const allPages: ScrapedPage[] = [];
+   770→   770→  const urlQueue: { url: string; depth: number }[] = [{ url: startUrl, depth: 0 }];
+   771→   771→
+   772→   772→  const sendProgress = (p: ScrapeProgress) => {
+   773→   773→    socket.emit('progress', { ...p, sessionId });
+   774→   774→  };
+   775→   775→
+   776→   776→  try {
+   777→   777→    sendProgress({ type: 'status', message: 'Starting scrape engine...' });
+   778→   778→
+   779→   779→    while (urlQueue.length > 0) {
+   780→   780→      const { url, depth: currentDepth } = urlQueue.shift()!;
+   781→   781→
+   782→   782→      if (visitedUrls.has(url)) continue;
+   783→   783→      visitedUrls.add(url);
+   784→   784→
+   785→   785→      if (currentDepth > depth) break;
+   786→   786→
+   787→   787→      sendProgress({
+   788→   788→        type: 'status',
+   789→   789→        message: `Scraping page ${allPages.length + 1} (depth ${currentDepth}/${depth})`,
+   790→   790→        current: allPages.length + 1,
+   791→   791→        total: visitedUrls.size + urlQueue.length,
+   792→   792→      });
+   793→   793→
+   794→   794→      try {
+   795→   795→        const page = await scrapePage(url, socket, {
+   796→   796→          current: allPages.length + 1,
+   797→   797→          total: visitedUrls.size + urlQueue.length,
+   798→   798→        });
+   799→   799→
+   800→   800→        allPages.push(page);
+   801→   801→
+   802→   802→        // Add child links to queue if followLinks is enabled
+   803→   803→        if (followLinks && currentDepth < depth) {
+   804→   804→          for (const link of page.childLinks) {
+   805→   805→            if (!visitedUrls.has(link)) {
+   806→   806→              urlQueue.push({ url: link, depth: currentDepth + 1 });
+   807→   807→              sendProgress({
+   808→   808→                type: 'link_found',
+   809→   809→                message: `Found related page: ${link}`,
+   810→   810→                url: link,
+   811→   811→              });
+   812→   812→            }
+   813→   813→          }
+   814→   814→        }
+   815→   815→      } catch (err: any) {
+   816→   816→        sendProgress({
+   817→   817→          type: 'error',
+   818→   818→          message: `Failed to scrape ${url}: ${err.message}`,
+   819→   819→          url,
+   820→   820→        });
+   821→   821→      }
+   822→   822→
+   823→   823→      // Delay between page requests
+   824→   824→      if (urlQueue.length > 0) {
+   825→   825→        await new Promise(r => setTimeout(r, 1000));
+   826→   826→      }
+   827→   827→    }
+   828→   828→
+   829→   829→    // Generate Word document
+   830→   830→    sendProgress({ type: 'status', message: `Generating Word document with ${allPages.length} page(s)...` });
+   831→   831→
+   832→   832→    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+   833→   833→    const sanitizedTitle = allPages[0]?.title.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 40) || 'scraped';
+   834→   834→    const fileName = `GFG_${sanitizedTitle}_${timestamp}.docx`;
+   835→   835→    const filePath = await generateDocx(allPages, fileName);
+   836→   836→
+   837→   837→    sendProgress({
+   838→   838→      type: 'complete',
+   839→   839→      message: `Document generated successfully! ${allPages.length} page(s) scraped.`,
+   840→   840→      filePath: `/download/${fileName}`,
+   841→   841→      fileName,
+   842→   842→    });
+   843→   843→
+   844→   844→    console.log(`[Scrape Complete] Session: ${sessionId}, Pages: ${allPages.length}, File: ${filePath}`);
+   845→   845→  } catch (err: any) {
+   846→   846→    sendProgress({
+   847→   847→      type: 'error',
+   848→   848→      message: `Scrape failed: ${err.message}`,
+   849→   849→    });
+   850→   850→    console.error(`[Scrape Error] Session: ${sessionId}`, err);
+   851→   851→  }
+   852→   852→}
+   853→   853→
+   854→   854→// ─── Socket.IO Server ─────────────────────────────────────────────────────
+   855→   855→
+   856→   856→io.on('connection', (socket) => {
+   857→   857→  console.log(`Client connected: ${socket.id}`);
+   858→   858→
+   859→   859→  socket.on('scrape', async (data: { url: string; depth: number; followLinks: boolean }) => {
+   860→   860→    const { url, depth = 1, followLinks = true } = data;
+   861→   861→
+   862→   862→    if (!url) {
+   863→   863→      socket.emit('progress', { type: 'error', message: 'URL is required' });
+   864→   864→      return;
+   865→   865→    }
+   866→   866→
+   867→   867→    // Validate URL
+   868→   868→    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+   869→   869→      socket.emit('progress', { type: 'error', message: 'Invalid URL format. Must start with http:// or https://' });
+   870→   870→      return;
+   871→   871→    }
+   872→   872→
+   873→   873→    const sessionId = socket.id;
+   874→   874→    console.log(`[Scrape Start] Session: ${sessionId}, URL: ${url}, Depth: ${depth}, FollowLinks: ${followLinks}`);
+   875→   875→
+   876→   876→    // Run the scrape orchestration
+   877→   877→    await orchestrateScrape(url, depth, followLinks, socket, sessionId);
+   878→   878→  });
+   879→   879→
+   880→   880→  socket.on('disconnect', () => {
+   881→   881→    console.log(`Client disconnected: ${socket.id}`);
+   882→   882→  });
+   883→   883→
+   884→   884→  socket.on('error', (error) => {
+   885→   885→    console.error(`Socket error (${socket.id}):`, error);
+   886→   886→  });
+   887→   887→});
+   888→   888→
+   889→   889→const PORT = 3004;
+   890→   890→httpServer.listen(PORT, () => {
+   891→   891→  console.log(`Scrape service running on port ${PORT}`);
+   892→   892→});
+   893→   893→
+   894→   894→process.on('SIGTERM', () => {
+   895→   895→  console.log('Received SIGTERM, shutting down...');
+   896→   896→  httpServer.close(() => process.exit(0));
+   897→   897→});
+   898→   898→
+   899→   899→process.on('SIGINT', () => {
+   900→   900→  console.log('Received SIGINT, shutting down...');
+   901→   901→  httpServer.close(() => process.exit(0));
+   902→   902→});
