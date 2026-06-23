@@ -7,8 +7,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 // ─── Config ────────────────────────────────────────────────────────────────
-const MAX_PAGES = 20;
-const MAX_CHILD_LINKS = 15;
 const IMAGES_DIR = process.env.IMAGES_DIR || '/home/z/my-project/images';
 const MAX_IMG_W = 600;
 
@@ -352,7 +350,7 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
 
   if (carouselImgs.length > 0) {
     const downloaded: ProcessedImage[] = [];
-    for (let i = 0; i < Math.min(carouselImgs.length, 30); i++) {
+    for (let i = 0; i < carouselImgs.length; i++) {
       emit({ type: 'image_done', message: `Downloading carousel image ${i + 1}/${carouselImgs.length}`, url: carouselImgs[i].url });
       const img = await downloadAndProcessImage(carouselImgs[i].url, imageDir);
       if (img) { downloaded.push({ ...img, alt: carouselImgs[i].alt }); imageOrder++; images.push(img); }
@@ -391,7 +389,7 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
       const codeEl = el.find('code').first();
       const code = codeEl.length > 0 ? el.find('code').text() : el.text();
       const c = code.trim();
-      if (c.length > 5 && !seen.has(c)) { seen.add(c); sections.push({ type: 'code', content: c.substring(0, 8000) }); }
+      if (c.length > 1 && !seen.has(c)) { seen.add(c); sections.push({ type: 'code', content: c }); }
       return;
     }
 
@@ -413,7 +411,7 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
     // Lists
     if (tag === 'ul' || tag === 'ol') {
       const items: string[] = [];
-      el.find('> li').each((_li, li) => { const t = $(li).text().trim().replace(/\s+/g, ' '); if (t.length > 2) items.push(t); });
+      el.find('> li').each((_li, li) => { const t = $(li).text().trim().replace(/\s+/g, ' '); if (t.length > 0) items.push(t); });
       if (items.length > 0) { const key = items.join('\n'); if (!seen.has(key)) { seen.add(key); sections.push({ type: 'list', content: '', items }); } }
       return;
     }
@@ -450,10 +448,10 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
         const clean = raw.replace(/\s+/g, ' ').trim();
         if (clean.length > 2 && !seenFormula.has(clean)) { seenFormula.add(clean); formulas.push(clean); sections.push({ type: 'formula', content: clean }); }
         const surrounding = el.clone().find('.mathjax, .MathJax, .katex, math, script[type*="math/tex"]').remove().end().text().trim().replace(/\s+/g, ' ');
-        if (surrounding.length > 10 && !seen.has(surrounding)) { seen.add(surrounding); sections.push({ type: 'paragraph', content: surrounding }); }
+        if (surrounding.length > 0 && !seen.has(surrounding)) { seen.add(surrounding); sections.push({ type: 'paragraph', content: surrounding }); }
       } else {
         const t = el.text().trim().replace(/\s+/g, ' ');
-        if (t.length > 10 && !seen.has(t)) { seen.add(t); sections.push({ type: 'paragraph', content: t }); }
+        if (t.length > 0 && !seen.has(t)) { seen.add(t); sections.push({ type: 'paragraph', content: t }); }
       }
       return;
     }
@@ -469,9 +467,9 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
   // Fallback
   if (sections.filter(s => s.type === 'heading' || s.type === 'paragraph').length === 0) {
     const text = clone.text().replace(/\s+/g, ' ').trim();
-    if (text.length > 50) {
-      const paras = text.split(/\n\n|(?<=[.!?])\s+(?=[A-Z])/).filter(p => p.trim().length > 20);
-      for (const p of paras.slice(0, 20)) if (!seen.has(p.trim())) { seen.add(p.trim()); sections.push({ type: 'paragraph', content: p.trim() }); }
+    if (text.length > 10) {
+      const paras = text.split(/\n\n|(?<=[.!?])\s+(?=[A-Z])/).filter(p => p.trim().length > 0);
+      for (const p of paras) if (!seen.has(p.trim())) { seen.add(p.trim()); sections.push({ type: 'paragraph', content: p.trim() }); }
     }
   }
 
@@ -495,7 +493,7 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
       }
     } catch { /* skip */ }
   });
-  childLinks.splice(MAX_CHILD_LINKS);
+  // All child links included (no limit)
 
   // Register in memory
   registerPage(url, title, topic);
@@ -539,8 +537,8 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
 export async function scrapeTopic(
   startUrl: string,
   topic: string,
-  depth: number,
-  maxPages: number,
+  _depth: number,
+  _maxPages: number,
   emit: (e: ScrapeEvent) => void,
   imageDir: string = IMAGES_DIR,
 ): Promise<{ pages: ScrapedPageData[]; crossRefs: CrossRefEntry[] }> {
@@ -551,11 +549,10 @@ export async function scrapeTopic(
 
   emit({ type: 'status', message: `Starting topic: "${topic}" from ${startUrl}`, topic });
 
-  while (queue.length > 0 && allPages.length < maxPages) {
+  while (queue.length > 0) {
     const { url, d } = queue.shift()!;
     if (visited.has(url)) continue;
     visited.add(url);
-    if (d > depth) break;
 
     try {
       const page = await scrapePage(url, topic, emit, imageDir);
@@ -567,13 +564,11 @@ export async function scrapeTopic(
 
       allPages.push(page);
 
-      // Queue child links
-      if (d < depth) {
-        for (const link of page.childLinks) {
-          if (!visited.has(link) && allPages.length + queue.length < maxPages) {
-            queue.push({ url: link, d: d + 1 });
-            emit({ type: 'link_found', message: `Found: ${link}`, url: link });
-          }
+      // Queue child links (no depth limit - follows all links)
+      for (const link of page.childLinks) {
+        if (!visited.has(link)) {
+          queue.push({ url: link, d: d + 1 });
+          emit({ type: 'link_found', message: `Found: ${link}`, url: link });
         }
       }
     } catch (err: any) {

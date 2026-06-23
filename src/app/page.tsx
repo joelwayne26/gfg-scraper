@@ -8,12 +8,11 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Badge } from '@/components/ui/badge';
 import { Progress } from '@/components/ui/progress';
 import { Switch } from '@/components/ui/switch';
-import { Slider } from '@/components/ui/slider';
 import { Label } from '@/components/ui/label';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
   Globe, Download, Play, Loader2, CheckCircle2, XCircle,
-  ImageIcon, Link2, FileText, AlertTriangle, Zap, ArrowRight, Layers, Settings2, BookOpen, RefreshCw
+  ImageIcon, Link2, FileText, AlertTriangle, Zap, ArrowRight, Settings2, BookOpen, RefreshCw
 } from 'lucide-react';
 
 interface ScrapeEvent {
@@ -41,8 +40,6 @@ interface TopicInfo {
 export default function Home() {
   const [url, setUrl] = useState('https://www.geeksforgeeks.org/natural-language-processing-nlp/');
   const [topic, setTopic] = useState('NLP');
-  const [depth, setDepth] = useState(1);
-  const [maxPages, setMaxPages] = useState(15);
   const [followLinks, setFollowLinks] = useState(true);
   const [isConnected, setIsConnected] = useState(false);
   const [isScraping, setIsScraping] = useState(false);
@@ -97,7 +94,7 @@ export default function Home() {
   // Auto-scroll
   useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [events]);
 
-  const computedProgress = isScraping ? Math.min((pagesScraped * 40 + imagesDownloaded * 3) / (maxPages * 40) * 100, 95) : completedFile ? 100 : 0;
+  const computedProgress = isScraping ? Math.min((pagesScraped * 10 + imagesDownloaded * 1) * 2, 95) : completedFile ? 100 : 0;
 
   // API-based scraping (for Vercel)
   const handleApiScrape = useCallback(async () => {
@@ -109,7 +106,7 @@ export default function Home() {
       const res = await fetch('/api/scrape', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url.trim(), topic, depth, maxPages, followLinks }),
+        body: JSON.stringify({ url: url.trim(), topic, followLinks }),
       });
 
       if (!res.ok) {
@@ -150,15 +147,15 @@ export default function Home() {
       setIsScraping(false);
       setEvents(prev => [...prev, { type: 'error', message: `Failed: ${err.message}` }]);
     }
-  }, [url, topic, depth, maxPages, followLinks]);
+  }, [url, topic, followLinks]);
 
   // WebSocket-based scraping
   const handleSocketScrape = useCallback(() => {
     if (!socketRef.current || !isConnected) return;
     setEvents([]); setPagesScraped(0); setImagesDownloaded(0); setLinksFound(0); setXrefCount(0);
     setCompletedFile(null); setIsScraping(true);
-    socketRef.current.emit('scrape', { url: url.trim(), depth, followLinks });
-  }, [url, depth, maxPages, followLinks, isConnected]);
+    socketRef.current.emit('scrape', { url: url.trim(), followLinks });
+  }, [url, followLinks, isConnected]);
 
   const handleScrape = useApi ? handleApiScrape : handleSocketScrape;
 
@@ -229,30 +226,14 @@ export default function Home() {
                   )}
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                  <div className="space-y-3 p-4 rounded-lg bg-gray-50 border border-gray-100">
-                    <div className="flex items-center justify-between">
-                      <Label className="text-sm font-medium text-gray-700 flex items-center gap-1.5"><Layers className="h-3.5 w-3.5" /> Depth</Label>
-                      <Badge variant="secondary" className="font-mono text-xs">{depth}</Badge>
-                    </div>
-                    <Slider value={[depth]} onValueChange={v => setDepth(v[0])} min={0} max={3} step={1} disabled={isScraping} />
+                <div className="flex items-center justify-between p-4 rounded-lg bg-gray-50 border border-gray-100">
+                  <div>
+                    <Label className="text-sm font-medium text-gray-700 flex items-center gap-1.5"><ArrowRight className="h-3.5 w-3.5" /> Follow Links</Label>
+                    <p className="text-xs text-gray-500 mt-1">Recursively scrape all linked GFG pages (no depth or page limit)</p>
                   </div>
-                  <div className="space-y-3 p-4 rounded-lg bg-gray-50 border border-gray-100">
-                    <div className="flex items-center justify-between">
-                      <Label className="text-sm font-medium text-gray-700 flex items-center gap-1.5"><FileText className="h-3.5 w-3.5" /> Max Pages</Label>
-                      <Badge variant="secondary" className="font-mono text-xs">{maxPages}</Badge>
-                    </div>
-                    <Slider value={[maxPages]} onValueChange={v => setMaxPages(v[0])} min={1} max={20} step={1} disabled={isScraping} />
-                  </div>
-                  <div className="space-y-3 p-4 rounded-lg bg-gray-50 border border-gray-100 flex flex-col justify-between">
-                    <div>
-                      <Label className="text-sm font-medium text-gray-700 flex items-center gap-1.5"><ArrowRight className="h-3.5 w-3.5" /> Follow Links</Label>
-                      <p className="text-xs text-gray-500 mt-1">Recursively scrape related pages</p>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-gray-600">{followLinks ? 'On' : 'Off'}</span>
-                      <Switch checked={followLinks} onCheckedChange={setFollowLinks} disabled={isScraping} />
-                    </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm text-gray-600">{followLinks ? 'On' : 'Off'}</span>
+                    <Switch checked={followLinks} onCheckedChange={setFollowLinks} disabled={isScraping} />
                   </div>
                 </div>
               </CardContent>
@@ -379,7 +360,7 @@ export default function Home() {
                 <div className="space-y-3">
                   <h3 className="font-semibold text-gray-900">How It Works</h3>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-sm text-gray-600">
-                    {[['1', 'Enter URL + Topic name, click Start Scrape'], ['2', 'Content, images, formulas extracted in order'], ['3', 'Images resized with correct aspect ratios (sharp)'], ['4', 'LaTeX formulas converted to Unicode math symbols'], ['5', 'Cross-references tracked: duplicate pages are referenced, not re-scraped'], ['6', 'Related hyperlinks followed recursively'], ['7', 'Professional Word document generated for download']].map(([n, d]) => (
+                    {[['1', 'Enter URL + Topic name, click Start Scrape'], ['2', 'Content, images, formulas extracted in order'], ['3', 'All images downloaded and inserted at correct positions'], ['4', 'LaTeX formulas converted to Unicode math symbols'], ['5', 'Cross-references tracked: duplicate pages are referenced, not re-scraped'], ['6', 'All hyperlinks followed recursively (no limits)'], ['7', 'Professional Word document generated with faithful content transfer']].map(([n, d]) => (
                       <div key={n} className="flex items-start gap-2"><span className="text-emerald-500 font-bold">{n}.</span><span>{d}</span></div>
                     ))}
                   </div>

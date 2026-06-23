@@ -9,7 +9,7 @@ export const maxDuration = 300; // Vercel pro allows up to 300s
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { url, topic, depth = 1, maxPages = 10 } = body;
+    const { url, topic } = body;
 
     if (!url || !topic) {
       return NextResponse.json({ error: 'url and topic are required' }, { status: 400 });
@@ -26,8 +26,8 @@ export async function POST(request: NextRequest) {
     const { pages, crossRefs } = await scrapeTopic(
       url,
       topic,
-      depth,
-      maxPages,
+      999, // no effective depth limit
+      999999, // no effective page limit
       (event) => { events.push(event); },
     );
 
