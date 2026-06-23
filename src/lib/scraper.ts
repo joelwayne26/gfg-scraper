@@ -1,16 +1,8 @@
 import * as cheerio from 'cheerio';
-import * as https from 'https';
-import * as http from 'http';
-import sharp from 'sharp';
 import * as crypto from 'crypto';
-import * as fs from 'fs';
-import * as path from 'path';
 
 // ─── Config ────────────────────────────────────────────────────────────────
-const IMAGES_DIR = process.env.IMAGES_DIR || '/home/z/my-project/images';
 const MAX_IMG_W = 600;
-
-if (!fs.existsSync(IMAGES_DIR)) fs.mkdirSync(IMAGES_DIR, { recursive: true });
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -46,8 +38,8 @@ export interface ScrapedPageData {
   images: ProcessedImage[];
   formulas: string[];
   childLinks: string[];
-  isNew: boolean;           // false if already scraped under another topic
-  existingTopics: string[];  // topics where this page already exists
+  isNew: boolean;
+  existingTopics: string[];
 }
 
 export interface CrossRefEntry {
@@ -81,87 +73,149 @@ export function checkPage(url: string): { title: string; topic: string; scrapedA
   return pageRegistry.get(url);
 }
 
-export function getAllPagesForTopic(topic: string): Map<string, { title: string; topic: string; scrapedAt: Date }> {
-  const result = new Map<string, { title: string; topic: string; scrapedAt: Date }>();
-  for (const [url, data] of pageRegistry) {
-    if (data.topic === topic) result.set(url, data);
-  }
-  return result;
+export function loadRegistryFromDB(_db: any) {
+  // DB not available on Vercel serverless - session-only cross-referencing
 }
 
-// Load from DB on startup (called by the API route)
-export async function loadRegistryFromDB(db: any) {
+// ─── Fetch helpers (serverless-compatible) ────────────────────────────────
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+async function fetchPageHtml(url: string): Promise<string> {
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': UA,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  return res.text();
+}
+
+async function fetchImageBuffer(url: string): Promise<{ buffer: Buffer; contentType: string } | null> {
   try {
-    const existing = await db.scrapedPage.findMany({ select: { url: true, title: true, topic: true, scrapedAt: true } });
-    for (const row of existing) {
-      pageRegistry.set(row.url, { title: row.title, topic: row.topic, scrapedAt: row.scrapedAt });
-    }
-  } catch { /* DB might not be ready */ }
-}
-
-// ─── Image Downloader ──────────────────────────────────────────────────────
-
-async function downloadAndProcessImage(url: string, imageDir: string): Promise<ProcessedImage | null> {
-  return new Promise((resolve) => {
-    if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) { resolve(null); return; }
-
-    const client = url.startsWith('https') ? https : http;
-    const timeout = setTimeout(() => resolve(null), 20000);
-    const req = client.get(url, {
+    const res = await fetch(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'User-Agent': UA,
         'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
         'Referer': 'https://www.geeksforgeeks.org/',
-      }
-    }, (res) => {
-      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        clearTimeout(timeout);
-        downloadAndProcessImage(res.headers.location, imageDir).then(resolve);
-        return;
-      }
-      if (res.statusCode !== 200) { clearTimeout(timeout); resolve(null); return; }
-
-      const chunks: Buffer[] = [];
-      res.on('data', (c: Buffer) => chunks.push(c));
-      res.on('end', async () => {
-        clearTimeout(timeout);
-        try {
-          const raw = Buffer.concat(chunks);
-          if (raw.length < 500) { resolve(null); return; }
-
-          const meta = await sharp(raw).metadata();
-          const w = meta.width || 580;
-          const h = meta.height || 360;
-          let processed: Buffer;
-          if (w > MAX_IMG_W) {
-            processed = await sharp(raw).resize(MAX_IMG_W, null, { withoutEnlargement: true, fit: 'inside' }).png({ quality: 90 }).toBuffer();
-          } else {
-            processed = await sharp(raw).png({ quality: 90 }).toBuffer();
-          }
-
-          // Save to disk
-          const hash = crypto.createHash('md5').update(url).digest('hex').substring(0, 12);
-          const fileName = `img_${hash}.png`;
-          const localPath = path.join(imageDir, fileName);
-          fs.writeFileSync(localPath, processed);
-
-          resolve({ buffer: processed, ext: '.png', width: w, height: h, localPath, fileName });
-        } catch {
-          const raw = Buffer.concat(chunks);
-          if (raw.length > 500) {
-            const hash = crypto.createHash('md5').update(url).digest('hex').substring(0, 12);
-            const fileName = `img_${hash}.png`;
-            const localPath = path.join(imageDir, fileName);
-            fs.writeFileSync(localPath, raw);
-            resolve({ buffer: raw, ext: '.png', width: 580, height: 360, localPath, fileName });
-          } else { resolve(null); }
-        }
-      });
-      res.on('error', () => { clearTimeout(timeout); resolve(null); });
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(20000),
     });
-    req.on('error', () => { clearTimeout(timeout); resolve(null); });
-    req.setTimeout(20000, () => { req.destroy(); clearTimeout(timeout); resolve(null); });
-  });
+    if (!res.ok) return null;
+    const ct = res.headers.get('content-type') || 'image/png';
+    const arrayBuf = await res.arrayBuffer();
+    const buf = Buffer.from(arrayBuf);
+    if (buf.length < 500) return null;
+    return { buffer: buf, contentType: ct };
+  } catch {
+    return null;
+  }
+}
+
+// ─── Image Downloader (in-memory, no filesystem) ─────────────────────────
+
+async function downloadAndProcessImage(url: string): Promise<ProcessedImage | null> {
+  if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) return null;
+
+  const result = await fetchImageBuffer(url);
+  if (!result) return null;
+
+  const { buffer: rawBuf, contentType } = result;
+
+  // Determine extension from content-type
+  let ext = '.png';
+  if (contentType.includes('jpeg') || contentType.includes('jpg')) ext = '.jpg';
+  else if (contentType.includes('gif')) ext = '.gif';
+  else if (contentType.includes('webp')) ext = '.webp';
+  else if (contentType.includes('svg')) ext = '.svg';
+
+  // For PNG/JPG, try to get dimensions from buffer headers
+  let w = 580, h = 360;
+  try {
+    const dims = getImageDimensions(rawBuf, ext);
+    if (dims) { w = dims.width; h = dims.height; }
+  } catch { /* use defaults */ }
+
+  // Simple scaling - if wider than max, calculate proportional height
+  // We keep the original buffer (no sharp on serverless) but store correct display dimensions
+  const displayW = w > MAX_IMG_W ? MAX_IMG_W : w;
+  const displayH = w > MAX_IMG_W ? Math.round(h * (MAX_IMG_W / w)) : h;
+
+  const hash = crypto.createHash('md5').update(url).digest('hex').substring(0, 12);
+  const fileName = `img_${hash}${ext === '.jpg' ? '.png' : ext}`;
+  // Convert to PNG for docx compatibility (docx prefers PNG/JPG)
+  let finalBuffer = rawBuf;
+  let finalExt = ext;
+
+  // If it's a webp or gif, we'll just store as-is with png extension
+  // docx library handles most image formats
+  if (ext === '.webp' || ext === '.gif' || ext === '.svg') {
+    finalExt = '.png';
+    finalBuffer = rawBuf; // store raw, docx will try to embed
+  }
+  if (ext === '.jpg') {
+    finalExt = '.jpg';
+    finalBuffer = rawBuf;
+  }
+
+  return {
+    buffer: finalBuffer,
+    ext: finalExt,
+    width: displayW,
+    height: displayH,
+    localPath: fileName,
+    fileName,
+  };
+}
+
+// Simple image dimension reader from buffer headers (no sharp needed)
+function getImageDimensions(buf: Buffer, ext: string): { width: number; height: number } | null {
+  try {
+    if (ext === '.png' || (buf[0] === 0x89 && buf[1] === 0x50)) {
+      // PNG: width at offset 16 (4 bytes BE), height at offset 20
+      if (buf.length >= 24) {
+        const w = buf.readUInt32BE(16);
+        const h = buf.readUInt32BE(20);
+        if (w > 0 && h > 0 && w < 10000 && h < 10000) return { width: w, height: h };
+      }
+    }
+    if (ext === '.jpg' || (buf[0] === 0xFF && buf[1] === 0xD8)) {
+      // JPEG: parse SOF markers
+      let offset = 2;
+      while (offset < buf.length - 1) {
+        if (buf[offset] !== 0xFF) break;
+        const marker = buf[offset + 1];
+        if (marker === 0xC0 || marker === 0xC2) {
+          // SOF0 or SOF2
+          if (offset + 9 < buf.length) {
+            const h = buf.readUInt16BE(offset + 5);
+            const w = buf.readUInt16BE(offset + 7);
+            if (w > 0 && h > 0) return { width: w, height: h };
+          }
+        }
+        if (marker === 0xD8 || marker === 0xD9) { offset += 2; continue; }
+        if (marker === 0x00) { offset += 1; continue; }
+        if (offset + 3 < buf.length) {
+          const segLen = buf.readUInt16BE(offset + 2);
+          offset += 2 + segLen;
+        } else break;
+      }
+    }
+    if (ext === '.gif' || (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46)) {
+      // GIF: width at 6, height at 8 (2 bytes LE each)
+      if (buf.length >= 10) {
+        const w = buf.readUInt16LE(6);
+        const h = buf.readUInt16LE(8);
+        if (w > 0 && h > 0) return { width: w, height: h };
+      }
+    }
+  } catch { /* ignore */ }
+  return null;
 }
 
 // ─── LaTeX → Rich Unicode Text ─────────────────────────────────────────────
@@ -269,34 +323,7 @@ export { renderLatex };
 
 // ─── Page Scraper ──────────────────────────────────────────────────────────
 
-async function fetchPageHtml(url: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const client = url.startsWith('https') ? https : http;
-    const timeout = setTimeout(() => reject(new Error('Timeout fetching ' + url)), 30000);
-    const req = client.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-      }
-    }, (res) => {
-      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        clearTimeout(timeout);
-        fetchPageHtml(res.headers.location).then(resolve).catch(reject);
-        return;
-      }
-      if (res.statusCode !== 200) { clearTimeout(timeout); reject(new Error(`HTTP ${res.statusCode}`)); return; }
-      const chunks: Buffer[] = [];
-      res.on('data', (c: Buffer) => chunks.push(c));
-      res.on('end', () => { clearTimeout(timeout); resolve(Buffer.concat(chunks).toString('utf-8')); });
-      res.on('error', (e) => { clearTimeout(timeout); reject(e); });
-    });
-    req.on('error', (e) => { clearTimeout(timeout); reject(e); });
-    req.setTimeout(30000, () => { req.destroy(); clearTimeout(timeout); reject(new Error('Timeout')); });
-  });
-}
-
-export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEvent) => void, imageDir: string = IMAGES_DIR): Promise<ScrapedPageData> {
+export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEvent) => void): Promise<ScrapedPageData> {
   // ── Cross-reference check ──
   const existing = checkPage(url);
   if (existing && existing.topic !== topic) {
@@ -317,7 +344,7 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
 
   const html = await fetchPageHtml(url);
   const $ = cheerio.load(html);
-  const title = $('h1').first().text().trim() || $('title').text().trim() || path.basename(url).replace(/[-_]/g, ' ');
+  const title = $('h1').first().text().trim() || $('title').text().trim() || url.split('/').filter(Boolean).pop()?.replace(/[-_]/g, ' ') || 'Untitled';
 
   const sections: ContentSection[] = [];
   const images: ProcessedImage[] = [];
@@ -352,7 +379,7 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
     const downloaded: ProcessedImage[] = [];
     for (let i = 0; i < carouselImgs.length; i++) {
       emit({ type: 'image_done', message: `Downloading carousel image ${i + 1}/${carouselImgs.length}`, url: carouselImgs[i].url });
-      const img = await downloadAndProcessImage(carouselImgs[i].url, imageDir);
+      const img = await downloadAndProcessImage(carouselImgs[i].url);
       if (img) { downloaded.push({ ...img, alt: carouselImgs[i].alt }); imageOrder++; images.push(img); }
       await new Promise(r => setTimeout(r, 250));
     }
@@ -428,7 +455,7 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
       seenImg.add(src);
       imageOrder++;
       emit({ type: 'image_done', message: `Downloading image ${imageOrder}`, url: src });
-      const img = await downloadAndProcessImage(src, imageDir);
+      const img = await downloadAndProcessImage(src);
       if (img) {
         images.push(img);
         sections.push({ type: 'image', content: src, imageData: img.buffer, imageExt: img.ext, imageWidth: img.width, imageHeight: img.height });
@@ -498,35 +525,6 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
   // Register in memory
   registerPage(url, title, topic);
 
-  // Compute checksum
-  const checksum = crypto.createHash('sha256').update(html.substring(0, 5000)).digest('hex').substring(0, 16);
-
-  // Save to DB
-  try {
-    const { db } = await import('../lib/db');
-    await db.scrapedPage.upsert({
-      where: { url },
-      update: { title, topic, sectionCount: sections.length, imageCount: images.length, formulaCount: formulas.length, childLinks: JSON.stringify(childLinks), checksum },
-      create: { url, title, topic, sectionCount: sections.length, imageCount: images.length, formulaCount: formulas.length, childLinks: JSON.stringify(childLinks), checksum },
-    });
-    // Save images
-    for (const img of images) {
-      await db.scrapedImage.upsert({
-        where: { id: `${url}#${img.fileName}` },
-        update: {},
-        create: { id: `${url}#${img.fileName}`, pageId: url, url: img.localPath, filePath: img.localPath, fileName: img.fileName, order: images.indexOf(img), width: img.width, height: img.height, alt: img.alt },
-      }).catch(() => {});
-    }
-    // Save formulas
-    for (let i = 0; i < formulas.length; i++) {
-      await db.scrapedFormula.upsert({
-        where: { id: `${url}#formula${i}` },
-        update: {},
-        create: { id: `${url}#formula${i}`, pageId: url, latex: formulas[i], rendered: renderLatex(formulas[i]), order: i },
-      }).catch(() => {});
-    }
-  } catch { /* DB might not be available on Vercel */ }
-
   emit({ type: 'page_done', message: `Completed: ${title} (${sections.length} sections, ${images.length} images, ${formulas.length} formulas)`, url });
 
   return { url, title, sections, images, formulas, childLinks, isNew: true, existingTopics: [] };
@@ -540,7 +538,6 @@ export async function scrapeTopic(
   _depth: number,
   _maxPages: number,
   emit: (e: ScrapeEvent) => void,
-  imageDir: string = IMAGES_DIR,
 ): Promise<{ pages: ScrapedPageData[]; crossRefs: CrossRefEntry[] }> {
   const visited = new Set<string>();
   const allPages: ScrapedPageData[] = [];
@@ -555,11 +552,11 @@ export async function scrapeTopic(
     visited.add(url);
 
     try {
-      const page = await scrapePage(url, topic, emit, imageDir);
+      const page = await scrapePage(url, topic, emit);
 
       if (!page.isNew && page.existingTopics.length > 0) {
         crossRefs.push({ url: page.url, title: page.title, topics: page.existingTopics });
-        continue; // Don't add to pages, but record the cross-reference
+        continue;
       }
 
       allPages.push(page);
@@ -577,16 +574,6 @@ export async function scrapeTopic(
 
     if (queue.length > 0) await new Promise(r => setTimeout(r, 1200));
   }
-
-  // Save topic
-  try {
-    const { db } = await import('../lib/db');
-    await db.topic.upsert({
-      where: { name: topic },
-      update: { pageCount: allPages.length, startUrl, depth, updatedAt: new Date() },
-      create: { name: topic, startUrl, depth, pageCount: allPages.length },
-    });
-  } catch { /* DB might not be available */ }
 
   emit({ type: 'topic_done', message: `Topic "${topic}" complete: ${allPages.length} new pages, ${crossRefs.length} cross-referenced`, topic, pagesScraped: allPages.length, pagesReferenced: crossRefs.length, imagesDownloaded: allPages.reduce((s, p) => s + p.images.length, 0) });
 

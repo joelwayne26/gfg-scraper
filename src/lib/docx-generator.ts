@@ -3,19 +3,13 @@ import {
   AlignmentType, BorderStyle, Table, TableRow, TableCell,
   WidthType, ShadingType, PageBreak, ExternalHyperlink,
 } from 'docx';
-import * as fs from 'fs';
-import * as path from 'path';
 import { renderLatex, type ContentSection, type ScrapedPageData, type CrossRefEntry } from './scraper';
 
-const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || '/home/z/my-project/download';
-if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
-
-export async function generateDocx(
+export async function generateDocxBuffer(
   pages: ScrapedPageData[],
   topic: string,
   crossRefs: CrossRefEntry[],
-  fileName?: string,
-): Promise<string> {
+): Promise<{ buffer: Buffer; fileName: string }> {
   const children: (Paragraph | Table)[] = [];
 
   // ── Cover Page ──
@@ -103,7 +97,7 @@ export async function generateDocx(
 
         case 'paragraph': {
           const clean = sec.content.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
-          if (clean.length < 3) continue;
+          if (clean.length < 1) continue;
           children.push(new Paragraph({
             children: [new TextRun({ text: clean, size: 22, font: 'Calibri' })],
             spacing: { after: 150, line: 312 }, alignment: AlignmentType.JUSTIFIED,
@@ -120,7 +114,6 @@ export async function generateDocx(
             border: { top: { style: BorderStyle.SINGLE, size: 2, color: 'd0d0d0' }, bottom: { style: BorderStyle.SINGLE, size: 2, color: 'd0d0d0' }, left: { style: BorderStyle.SINGLE, size: 6, color: '2d6a4f' } },
             shading: { type: ShadingType.CLEAR, fill: 'f0f7f4' },
           }));
-          // Also store the raw LaTeX in a comment-like line below for reference
           if (rendered !== sec.content) {
             children.push(new Paragraph({
               children: [new TextRun({ text: `LaTeX: ${sec.content}`, size: 16, font: 'Consolas', color: 'bbbbbb' })],
@@ -136,11 +129,18 @@ export async function generateDocx(
               const maxW = 520;
               let w = sec.imageWidth || 580, h = sec.imageHeight || 360;
               if (w > maxW) { const s = maxW / w; w = maxW; h = Math.round(h * s); }
+              // Determine image type from data or extension
+              const imgType = (sec.imageExt === '.jpg' || sec.imageExt === '.jpeg') ? 'jpg' as const : 'png' as const;
               children.push(new Paragraph({
-                children: [new ImageRun({ data: sec.imageData, transformation: { width: w, height: h }, type: 'png' })],
+                children: [new ImageRun({ data: sec.imageData, transformation: { width: w, height: h }, type: imgType })],
                 spacing: { before: 200, after: 100 }, alignment: AlignmentType.CENTER,
               }));
-            } catch { children.push(new Paragraph({ children: [new TextRun({ text: `[Image: ${sec.content}]`, italics: true, size: 18, color: '999999', font: 'Calibri' })], spacing: { after: 100 }, alignment: AlignmentType.CENTER })); }
+            } catch {
+              children.push(new Paragraph({
+                children: [new TextRun({ text: `[Image: ${sec.content}]`, italics: true, size: 18, color: '999999', font: 'Calibri' })],
+                spacing: { after: 100 }, alignment: AlignmentType.CENTER,
+              }));
+            }
           }
           break;
         }
@@ -158,8 +158,9 @@ export async function generateDocx(
                   const maxW = 520;
                   let w = img.width || 580, h = img.height || 360;
                   if (w > maxW) { const s = maxW / w; w = maxW; h = Math.round(h * s); }
+                  const imgType = (img.ext === '.jpg' || img.ext === '.jpeg') ? 'jpg' as const : 'png' as const;
                   children.push(new Paragraph({
-                    children: [new ImageRun({ data: img.buffer, transformation: { width: w, height: h }, type: 'png' })],
+                    children: [new ImageRun({ data: img.buffer, transformation: { width: w, height: h }, type: imgType })],
                     spacing: { before: 150, after: 80 }, alignment: AlignmentType.CENTER,
                   }));
                   if (img.alt) children.push(new Paragraph({
@@ -243,9 +244,7 @@ export async function generateDocx(
     sections: [{ properties: { page: { margin: { top: 720, bottom: 720, left: 900, right: 900 } } }, children }],
   });
 
-  const outName = fileName || `GFG_${topic.replace(/[^a-zA-Z0-9]/g, '_')}_${new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19)}.docx`;
-  const filePath = path.join(DOWNLOAD_DIR, outName);
+  const fileName = `GFG_${topic.replace(/[^a-zA-Z0-9]/g, '_')}_${new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19)}.docx`;
   const buffer = await Packer.toBuffer(doc);
-  fs.writeFileSync(filePath, buffer);
-  return outName;
+  return { buffer, fileName };
 }

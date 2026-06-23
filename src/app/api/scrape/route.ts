@@ -1,10 +1,8 @@
-import * as fs from 'fs';
-import * as path from 'path';
 import { NextRequest, NextResponse } from 'next/server';
-import { scrapeTopic, loadRegistryFromDB } from '@/lib/scraper';
-import { generateDocx } from '@/lib/docx-generator';
+import { scrapeTopic } from '@/lib/scraper';
+import { generateDocxBuffer } from '@/lib/docx-generator';
 
-export const maxDuration = 300; // Vercel pro allows up to 300s
+export const maxDuration = 300;
 
 export async function POST(request: NextRequest) {
   try {
@@ -15,19 +13,13 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'url and topic are required' }, { status: 400 });
     }
 
-    // Load existing page registry for cross-referencing
-    try {
-      const { db } = await import('@/lib/db');
-      await loadRegistryFromDB(db);
-    } catch { /* DB not available on Vercel - cross-referencing will be session-only */ }
-
     const events: any[] = [];
 
     const { pages, crossRefs } = await scrapeTopic(
       url,
       topic,
-      999, // no effective depth limit
-      999999, // no effective page limit
+      999,
+      999999,
       (event) => { events.push(event); },
     );
 
@@ -35,26 +27,27 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'No pages scraped', events, crossRefs: crossRefs.length });
     }
 
-    const downloadDir = process.env.DOWNLOAD_DIR || path.join(process.cwd(), 'download');
-    if (!fs.existsSync(downloadDir)) fs.mkdirSync(downloadDir, { recursive: true });
+    const { buffer, fileName } = await generateDocxBuffer(pages, topic, crossRefs);
 
-    const fileName = await generateDocx(pages, topic, crossRefs);
-
-    return NextResponse.json({
-      success: true,
-      fileName,
-      downloadUrl: `/api/download?file=${encodeURIComponent(fileName)}`,
-      stats: {
-        pagesScraped: pages.length,
-        pagesReferenced: crossRefs.length,
-        imagesDownloaded: pages.reduce((s, p) => s + p.images.length, 0),
-        formulasExtracted: pages.reduce((s, p) => s + p.formulas.length, 0),
-        events: events.length,
+    // Return the docx directly as a downloadable response
+    return new NextResponse(buffer, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'Content-Disposition': `attachment; filename="${fileName}"`,
+        'Content-Length': buffer.length.toString(),
+        // Custom header with stats for the frontend
+        'X-Scrape-Stats': JSON.stringify({
+          pagesScraped: pages.length,
+          pagesReferenced: crossRefs.length,
+          imagesDownloaded: pages.reduce((s, p) => s + p.images.length, 0),
+          formulasExtracted: pages.reduce((s, p) => s + p.formulas.length, 0),
+          fileName,
+        }),
       },
-      events,
-      crossRefs,
     });
   } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    console.error('Scrape error:', err);
+    return NextResponse.json({ error: err.message, stack: err.stack?.substring(0, 500) }, { status: 500 });
   }
 }

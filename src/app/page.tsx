@@ -100,7 +100,7 @@ export default function Home() {
   const handleApiScrape = useCallback(async () => {
     setEvents([]); setPagesScraped(0); setImagesDownloaded(0); setLinksFound(0); setXrefCount(0);
     setCompletedFile(null); setIsScraping(true);
-    setEvents([{ type: 'status', message: `Starting API scrape for "${topic}"...` }]);
+    setEvents([{ type: 'status', message: `Starting API scrape for "${topic}"... (this may take a few minutes)` }]);
 
     try {
       const res = await fetch('/api/scrape', {
@@ -109,39 +109,39 @@ export default function Home() {
         body: JSON.stringify({ url: url.trim(), topic, followLinks }),
       });
 
-      if (!res.ok) {
+      // Check if error JSON returned
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok && contentType.includes('json')) {
         const err = await res.json();
         throw new Error(err.error || 'Scrape failed');
       }
-
-      const data = await res.json();
-
-      // Replay events
-      if (data.events) {
-        for (const e of data.events) {
-          setEvents(prev => [...prev, e]);
-          if (e.type === 'page_done') setPagesScraped(p => p + 1);
-          if (e.type === 'image_done') setImagesDownloaded(i => i + 1);
-          if (e.type === 'link_found') setLinksFound(l => l + 1);
-          if (e.type === 'xref_found') setXrefCount(x => x + 1);
-        }
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: Scrape failed`);
       }
 
-      if (data.stats) {
-        setPagesScraped(data.stats.pagesScraped);
-        setXrefCount(data.stats.pagesReferenced);
-        setImagesDownloaded(data.stats.imagesDownloaded);
+      // The response is the .docx file directly
+      const statsHeader = res.headers.get('x-scrape-stats');
+      const stats = statsHeader ? JSON.parse(statsHeader) : null;
+      const disp = res.headers.get('content-disposition') || '';
+      const fileNameMatch = disp.match(/filename="([^"]+)"/);
+      const fileName = fileNameMatch?.[1] || `GFG_${topic}.docx`;
+
+      // Create blob URL for download
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+
+      if (stats) {
+        setPagesScraped(stats.pagesScraped || 0);
+        setXrefCount(stats.pagesReferenced || 0);
+        setImagesDownloaded(stats.imagesDownloaded || 0);
       }
 
-      if (data.success && data.fileName) {
-        setCompletedFile({ fileName: data.fileName, downloadUrl: data.downloadUrl });
-      }
-
+      setCompletedFile({ fileName, downloadUrl: blobUrl });
       setIsScraping(false);
       setEvents(prev => [...prev, {
         type: 'complete',
-        message: `Done! ${data.stats?.pagesScraped || 0} pages, ${data.stats?.pagesReferenced || 0} cross-referenced, ${data.stats?.imagesDownloaded || 0} images.`,
-        fileName: data.fileName,
+        message: `Done! ${stats?.pagesScraped || '?'} pages, ${stats?.pagesReferenced || 0} cross-referenced, ${stats?.imagesDownloaded || '?'} images. Document ready for download.`,
+        fileName,
       }]);
     } catch (err: any) {
       setIsScraping(false);
