@@ -344,6 +344,15 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
 
   const html = await fetchPageHtml(url);
   const $ = cheerio.load(html);
+
+  // Detect 404 / error pages
+  if ($('.error-page, .error404, .page-404, [class*="404"]').length > 0 ||
+      $('title').text().toLowerCase().includes('404') ||
+      $('h1').first().text().trim().toLowerCase().includes('404')) {
+    emit({ type: 'error', message: `404 Not Found: ${url}`, url });
+    return { url, title: '404 Not Found', sections: [], images: [], formulas: [], childLinks: [], isNew: true, existingTopics: [] };
+  }
+
   const title = $('h1').first().text().trim() || $('title').text().trim() || url.split('/').filter(Boolean).pop()?.replace(/[-_]/g, ' ') || 'Untitled';
 
   const sections: ContentSection[] = [];
@@ -351,13 +360,23 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
   const formulas: string[] = [];
   let imageOrder = 0;
 
-  // Content area
-  const contentArea = $('article .article-content, .entry-content, article, .post-content, main .content').first();
+  // Content area — broad selectors to catch GFG's various layouts
+  const contentArea = $(
+    'article .article-content, article .entry-content, .entry-content, article.content, ' +
+    'main article, main .content, #post-content, .post-content, ' +
+    '.article-body, .article--content, .content-body, div[itemprop="articleBody"], ' +
+    '.GeeksforGeeks_content, .gfg-content'
+  ).first();
   const root = contentArea.length > 0 ? contentArea : $.root();
 
-  // Clone and clean
+  // Clone and clean — remove non-content elements
   const clone = root.clone();
-  clone.find('script, style, nav, footer, header, .sidebar, .navigation, .breadcrumb, .share, .social, .comments, .related, .ad, .advertisement, .widget, .popup, .modal, .overlay, .cookie, .newsletter, .subscribe').remove();
+  clone.find('script, style, nav, footer, header, .sidebar, .navigation, .breadcrumb, ' +
+    '.share, .social, .comments, .related, .ad, .advertisement, .widget, .popup, .modal, ' +
+    '.overlay, .cookie, .newsletter, .subscribe, .rating, .author, .meta, .tags, ' +
+    '.table-of-content, .toc, #table-of-content, .sticky, .notification, ' +
+    '.course-banner, .courses-banner, [class*="recommend"], [class*="suggestion"]'
+  ).remove();
 
   const seen = new Set<string>();
   const seenImg = new Set<string>();

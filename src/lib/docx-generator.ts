@@ -1,106 +1,73 @@
 import {
-  Document, Packer, Paragraph, TextRun, HeadingLevel, ImageRun,
-  AlignmentType, BorderStyle, Table, TableRow, TableCell,
-  WidthType, ShadingType, PageBreak, ExternalHyperlink,
+  Document, Packer, Paragraph, TextRun, ImageRun,
+  AlignmentType, Table, TableRow, TableCell,
+  WidthType, PageBreak,
 } from 'docx';
 import { renderLatex, type ContentSection, type ScrapedPageData, type CrossRefEntry } from './scraper';
 
 export async function generateDocxBuffer(
   pages: ScrapedPageData[],
   topic: string,
-  crossRefs: CrossRefEntry[],
+  _crossRefs: CrossRefEntry[],
 ): Promise<{ buffer: Buffer; fileName: string }> {
   const children: (Paragraph | Table)[] = [];
 
-  // ── Cover Page ──
-  children.push(new Paragraph({ spacing: { before: 2400 }, children: [] }));
+  // Simple title — just the topic name
   children.push(new Paragraph({
-    children: [new TextRun({ text: topic, bold: true, size: 52, font: 'Calibri', color: '1a5632' })],
-    alignment: AlignmentType.CENTER, spacing: { after: 200 },
+    children: [new TextRun({ text: ` ${topic}`, size: 48, bold: true, font: 'Calibri' })],
+    spacing: { after: 100 },
   }));
   children.push(new Paragraph({
-    children: [new TextRun({ text: 'Comprehensive Study Notes', size: 28, font: 'Calibri', color: '555555' })],
-    alignment: AlignmentType.CENTER, spacing: { after: 200 },
+    children: [new TextRun({ text: ` ${new Date().toLocaleDateString('en-US', { day: 'numeric', month: 'long', year: 'numeric' })}`, size: 22, font: 'Calibri' })],
+    spacing: { after: 100 },
   }));
   children.push(new Paragraph({
-    children: [new TextRun({ text: 'Scraped from GeeksforGeeks', size: 22, font: 'Calibri', color: '888888' })],
-    alignment: AlignmentType.CENTER, spacing: { after: 80 },
+    children: [new TextRun({ text: ` ${new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`, size: 22, font: 'Calibri' })],
+    spacing: { after: 400 },
   }));
-  children.push(new Paragraph({
-    children: [new TextRun({ text: `Generated: ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}`, size: 20, font: 'Calibri', color: '999999' })],
-    alignment: AlignmentType.CENTER, spacing: { after: 80 },
-  }));
-  children.push(new Paragraph({
-    children: [new TextRun({ text: `Pages: ${pages.length} | Images: ${pages.reduce((s, p) => s + p.images.length, 0)} | Cross-referenced: ${crossRefs.length}`, size: 20, font: 'Calibri', color: '999999', italics: true })],
-    alignment: AlignmentType.CENTER, spacing: { after: 400 },
-  }));
-
-  // ── Cross-References Section ──
-  if (crossRefs.length > 0) {
-    children.push(new Paragraph({ children: [new PageBreak()] }));
-    children.push(new Paragraph({
-      children: [new TextRun({ text: 'Cross-References (Already Scraped in Other Topics)', bold: true, size: 28, font: 'Calibri', color: '1a5632' })],
-      heading: HeadingLevel.HEADING_1, spacing: { after: 200 },
-      border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: '2d6a4f' } },
-    }));
-    children.push(new Paragraph({
-      children: [new TextRun({ text: `The following ${crossRefs.length} page(s) were already scraped under other topics and are referenced here instead of being duplicated.`, size: 22, font: 'Calibri', color: '555555' })],
-      spacing: { after: 200 }, alignment: AlignmentType.JUSTIFIED,
-    }));
-
-    for (const xref of crossRefs) {
-      const topicList = xref.topics.map(t => `"${t}"`).join(', ');
-      children.push(new Paragraph({
-        children: [
-          new TextRun({ text: '\u2022  ', size: 22, font: 'Calibri' }),
-          new TextRun({ text: xref.title, bold: true, size: 22, font: 'Calibri', color: '333333' }),
-          new TextRun({ text: ` \u2014 covered in topic(s): ${topicList}`, size: 20, font: 'Calibri', color: '888888', italics: true }),
-        ],
-        spacing: { after: 100, line: 312 }, indent: { left: 540, hanging: 180 },
-      }));
-      children.push(new Paragraph({
-        children: [new TextRun({ text: xref.url, size: 18, font: 'Calibri', color: 'aaaaaa' })],
-        spacing: { after: 150 }, indent: { left: 540 },
-      }));
-    }
-
-    children.push(new Paragraph({ children: [new PageBreak()] }));
-  }
 
   // ── Content Pages ──
   for (let pi = 0; pi < pages.length; pi++) {
     const page = pages[pi];
 
+    // Page title — plain bold, no colors/borders
     children.push(new Paragraph({
-      children: [new TextRun({ text: page.title, bold: true, size: 36, font: 'Calibri', color: '1a5632' })],
-      heading: HeadingLevel.HEADING_1, spacing: { after: 80 },
-      border: { bottom: { style: BorderStyle.SINGLE, size: 8, color: '2d6a4f' } },
+      children: [new TextRun({ text: ` ${page.title}`, bold: true, size: 32, font: 'Calibri' })],
+      spacing: { before: 400, after: 100 },
     }));
 
+    // URL as plain text
     children.push(new Paragraph({
-      children: [new ExternalHyperlink({ children: [new TextRun({ text: page.url, style: 'Hyperlink', size: 18, font: 'Calibri' })], link: page.url })],
-      spacing: { after: 250 },
+      children: [new TextRun({ text: page.url, size: 18, font: 'Calibri', color: '888888' })],
+      spacing: { after: 200 },
     }));
 
     for (const sec of page.sections) {
       switch (sec.type) {
         case 'heading': {
-          const lvl = Math.min(sec.level || 2, 4) as 1 | 2 | 3 | 4;
-          const hMap: Record<number, typeof HeadingLevel.HEADING_1> = { 1: HeadingLevel.HEADING_1, 2: HeadingLevel.HEADING_2, 3: HeadingLevel.HEADING_3, 4: HeadingLevel.HEADING_4 };
-          const sMap: Record<number, number> = { 1: 32, 2: 28, 3: 24, 4: 22 };
+          const lvl = sec.level || 2;
+          const sizes: Record<number, number> = { 1: 30, 2: 26, 3: 24, 4: 22, 5: 20, 6: 20 };
           children.push(new Paragraph({
-            children: [new TextRun({ text: sec.content, bold: true, size: sMap[lvl] || 26, font: 'Calibri', color: lvl <= 2 ? '1a5632' : '333333' })],
-            heading: hMap[lvl] || HeadingLevel.HEADING_2, spacing: { before: 300, after: 150 },
+            children: [new TextRun({ text: sec.content, bold: true, size: sizes[lvl] || 24, font: 'Calibri' })],
+            spacing: { before: 250, after: 80 },
           }));
           break;
         }
 
         case 'paragraph': {
-          const clean = sec.content.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
+          const clean = sec.content
+            .replace(/&nbsp;/g, ' ')
+            .replace(/&amp;/g, '&')
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;/g, "'")
+            .replace(/\s+/g, ' ')
+            .trim();
           if (clean.length < 1) continue;
           children.push(new Paragraph({
             children: [new TextRun({ text: clean, size: 22, font: 'Calibri' })],
-            spacing: { after: 150, line: 312 }, alignment: AlignmentType.JUSTIFIED,
+            spacing: { after: 120, line: 276 },
           }));
           break;
         }
@@ -108,37 +75,30 @@ export async function generateDocxBuffer(
         case 'formula': {
           const rendered = renderLatex(sec.content);
           children.push(new Paragraph({
-            children: [new TextRun({ text: rendered, italics: true, size: 22, font: 'Cambria Math', color: '1a1a2e' })],
-            spacing: { before: 250, after: 250, line: 360 }, alignment: AlignmentType.CENTER,
-            indent: { left: 720, right: 720 },
-            border: { top: { style: BorderStyle.SINGLE, size: 2, color: 'd0d0d0' }, bottom: { style: BorderStyle.SINGLE, size: 2, color: 'd0d0d0' }, left: { style: BorderStyle.SINGLE, size: 6, color: '2d6a4f' } },
-            shading: { type: ShadingType.CLEAR, fill: 'f0f7f4' },
+            children: [new TextRun({ text: rendered, size: 22, font: 'Cambria Math', italics: true })],
+            spacing: { before: 150, after: 150 },
           }));
-          if (rendered !== sec.content) {
-            children.push(new Paragraph({
-              children: [new TextRun({ text: `LaTeX: ${sec.content}`, size: 16, font: 'Consolas', color: 'bbbbbb' })],
-              spacing: { after: 200 }, alignment: AlignmentType.CENTER,
-            }));
-          }
           break;
         }
 
         case 'image': {
           if (sec.imageData && sec.imageData.length > 100) {
             try {
-              const maxW = 520;
-              let w = sec.imageWidth || 580, h = sec.imageHeight || 360;
+              let w = sec.imageWidth || 580;
+              let h = sec.imageHeight || 360;
+              const maxW = 550;
               if (w > maxW) { const s = maxW / w; w = maxW; h = Math.round(h * s); }
-              // Determine image type from data or extension
+              if (h < 10) h = 300;
+              if (w < 10) w = 500;
               const imgType = (sec.imageExt === '.jpg' || sec.imageExt === '.jpeg') ? 'jpg' as const : 'png' as const;
               children.push(new Paragraph({
                 children: [new ImageRun({ data: sec.imageData, transformation: { width: w, height: h }, type: imgType })],
-                spacing: { before: 200, after: 100 }, alignment: AlignmentType.CENTER,
+                spacing: { before: 120, after: 120 }, alignment: AlignmentType.CENTER,
               }));
             } catch {
               children.push(new Paragraph({
-                children: [new TextRun({ text: `[Image: ${sec.content}]`, italics: true, size: 18, color: '999999', font: 'Calibri' })],
-                spacing: { after: 100 }, alignment: AlignmentType.CENTER,
+                children: [new TextRun({ text: `[Image: ${sec.content}]`, size: 18, font: 'Calibri', italics: true })],
+                spacing: { after: 80 }, alignment: AlignmentType.CENTER,
               }));
             }
           }
@@ -146,26 +106,21 @@ export async function generateDocxBuffer(
         }
 
         case 'carousel': {
-          children.push(new Paragraph({
-            children: [new TextRun({ text: sec.content || 'Featured Images', bold: true, size: 22, font: 'Calibri', color: '555555' })],
-            spacing: { before: 200, after: 100 }, alignment: AlignmentType.CENTER,
-          }));
+          // Just paste all carousel images in order, no label
           if (sec.images) {
-            for (let i = 0; i < sec.images.length; i++) {
-              const img = sec.images[i];
+            for (const img of sec.images) {
               if (img.buffer.length > 100) {
                 try {
-                  const maxW = 520;
-                  let w = img.width || 580, h = img.height || 360;
+                  let w = img.width || 580;
+                  let h = img.height || 360;
+                  const maxW = 550;
                   if (w > maxW) { const s = maxW / w; w = maxW; h = Math.round(h * s); }
+                  if (h < 10) h = 300;
+                  if (w < 10) w = 500;
                   const imgType = (img.ext === '.jpg' || img.ext === '.jpeg') ? 'jpg' as const : 'png' as const;
                   children.push(new Paragraph({
                     children: [new ImageRun({ data: img.buffer, transformation: { width: w, height: h }, type: imgType })],
-                    spacing: { before: 150, after: 80 }, alignment: AlignmentType.CENTER,
-                  }));
-                  if (img.alt) children.push(new Paragraph({
-                    children: [new TextRun({ text: `Figure ${i + 1}: ${img.alt}`, italics: true, size: 18, color: '888888', font: 'Calibri' })],
-                    spacing: { after: 150 }, alignment: AlignmentType.CENTER,
+                    spacing: { before: 100, after: 100 }, alignment: AlignmentType.CENTER,
                   }));
                 } catch { /* skip */ }
               }
@@ -175,26 +130,30 @@ export async function generateDocxBuffer(
         }
 
         case 'code': {
-          children.push(new Paragraph({
-            children: [new TextRun({ text: 'Code', bold: true, size: 20, font: 'Calibri', color: '444444' })],
-            spacing: { before: 150, after: 50 }, shading: { type: ShadingType.CLEAR, fill: 'e8e8e8' },
-          }));
+          // Plain monospace text, no background, no label
           for (const line of sec.content.split('\n')) {
             children.push(new Paragraph({
               children: [new TextRun({ text: line || ' ', size: 18, font: 'Consolas' })],
-              spacing: { after: 0, line: 240 }, indent: { left: 360 }, shading: { type: ShadingType.CLEAR, fill: 'f5f5f5' },
+              spacing: { after: 0, line: 240 },
             }));
           }
-          children.push(new Paragraph({ children: [], spacing: { after: 150 } }));
+          children.push(new Paragraph({ children: [], spacing: { after: 120 } }));
           break;
         }
 
         case 'list': {
           if (sec.items) for (const item of sec.items) {
-            const clean = item.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/\s+/g, ' ').trim();
+            const clean = item
+              .replace(/&nbsp;/g, ' ')
+              .replace(/&amp;/g, '&')
+              .replace(/&lt;/g, '<')
+              .replace(/&gt;/g, '>')
+              .replace(/\s+/g, ' ')
+              .trim();
             children.push(new Paragraph({
-              children: [new TextRun({ text: '\u2022  ' + clean, size: 22, font: 'Calibri' })],
-              spacing: { after: 80, line: 312 }, indent: { left: 540, hanging: 180 },
+              children: [new TextRun({ text: clean, size: 22, font: 'Calibri' })],
+              spacing: { after: 60, line: 276 },
+              indent: { left: 360 },
             }));
           }
           break;
@@ -203,34 +162,30 @@ export async function generateDocxBuffer(
         case 'table': {
           if (sec.rows && sec.rows.length > 0) {
             const rows = sec.rows.map((row, ri) => new TableRow({
-              tableHeader: ri === 0, cantSplit: true,
+              tableHeader: ri === 0,
               children: row.map(cell => new TableCell({
-                children: [new Paragraph({ children: [new TextRun({ text: cell, bold: ri === 0, size: 20, font: 'Calibri', color: ri === 0 ? 'ffffff' : '333333' })], spacing: { after: 60 } })],
-                shading: ri === 0 ? { type: ShadingType.CLEAR, fill: '2d6a4f', color: 'auto' } : ri % 2 === 0 ? { type: ShadingType.CLEAR, fill: 'f0f7f4', color: 'auto' } : undefined,
-                margins: { top: 40, bottom: 40, left: 100, right: 100 },
+                children: [new Paragraph({
+                  children: [new TextRun({ text: cell, bold: ri === 0, size: 20, font: 'Calibri' })],
+                  spacing: { after: 40 },
+                })],
+                margins: { top: 40, bottom: 40, left: 80, right: 80 },
               })),
             }));
             children.push(new Table({ rows, width: { size: 100, type: WidthType.PERCENTAGE } }));
-            children.push(new Paragraph({ children: [], spacing: { after: 200 } }));
+            children.push(new Paragraph({ children: [], spacing: { after: 150 } }));
           }
           break;
         }
 
         case 'hr': {
-          children.push(new Paragraph({ children: [], spacing: { before: 100, after: 100 }, border: { bottom: { style: BorderStyle.SINGLE, size: 2, color: 'd0d0d0' } } }));
+          children.push(new Paragraph({ children: [], spacing: { after: 80 } }));
           break;
         }
 
         case 'xref': {
           children.push(new Paragraph({
-            children: [
-              new TextRun({ text: '\u2139  Cross-Reference: ', bold: true, size: 20, font: 'Calibri', color: 'd97706' }),
-              new TextRun({ text: sec.content, size: 20, font: 'Calibri', color: '92400e', italics: true }),
-              ...(sec.refTopic ? [new TextRun({ text: ` (covered in "${sec.refTopic}")`, size: 18, font: 'Calibri', color: 'b45309' })] : []),
-            ],
-            spacing: { before: 150, after: 150 }, indent: { left: 360 },
-            shading: { type: ShadingType.CLEAR, fill: 'fffbeb' },
-            border: { left: { style: BorderStyle.SINGLE, size: 8, color: 'd97706' } },
+            children: [new TextRun({ text: `[Already covered: ${sec.content}${sec.refTopic ? ` in "${sec.refTopic}"` : ''}]`, size: 20, font: 'Calibri', italics: true, color: '888888' })],
+            spacing: { before: 80, after: 80 },
           }));
           break;
         }
@@ -244,7 +199,7 @@ export async function generateDocxBuffer(
     sections: [{ properties: { page: { margin: { top: 720, bottom: 720, left: 900, right: 900 } } }, children }],
   });
 
-  const fileName = `GFG_${topic.replace(/[^a-zA-Z0-9]/g, '_')}_${new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19)}.docx`;
+  const fileName = `${topic.replace(/[^a-zA-Z0-9]/g, '_')}.docx`;
   const buffer = await Packer.toBuffer(doc);
   return { buffer, fileName };
 }
