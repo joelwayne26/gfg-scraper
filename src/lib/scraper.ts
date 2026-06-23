@@ -1,15 +1,26 @@
 import * as cheerio from 'cheerio';
 import * as crypto from 'crypto';
+import sharp from 'sharp';
+import katex from 'katex';
 
 // ─── Config ────────────────────────────────────────────────────────────────
-const MAX_IMG_W = 600;
+const MAX_IMG_W = 580;
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
+export interface InlineRun {
+  text: string;
+  bold?: boolean;
+  italics?: boolean;
+  code?: boolean;
+  link?: string;
+}
+
 export interface ContentSection {
-  type: 'heading' | 'paragraph' | 'code' | 'list' | 'table' | 'image' | 'formula' | 'carousel' | 'hr' | 'xref';
+  type: 'heading' | 'paragraph' | 'rich-paragraph' | 'code' | 'list' | 'table' | 'image' | 'formula-image' | 'carousel' | 'hr' | 'xref';
   level?: number;
   content: string;
+  runs?: InlineRun[];        // rich-paragraph uses this
   items?: string[];
   rows?: string[][];
   imageData?: Buffer;
@@ -73,21 +84,30 @@ export function checkPage(url: string): { title: string; topic: string; scrapedA
   return pageRegistry.get(url);
 }
 
-export function loadRegistryFromDB(_db: any) {
-  // DB not available on Vercel serverless - session-only cross-referencing
-}
+export function loadRegistryFromDB(_db: any) {}
 
-// ─── Fetch helpers (serverless-compatible) ────────────────────────────────
+// ─── Anti-bot fetch ────────────────────────────────────────────────────────
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const BROWSER_HEADERS: Record<string, string> = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+  'Sec-Ch-Ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+  'Sec-Ch-Ua-Mobile': '?0',
+  'Sec-Ch-Ua-Platform': '"Windows"',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Upgrade-Insecure-Requests': '1',
+};
 
 async function fetchPageHtml(url: string): Promise<string> {
   const res = await fetch(url, {
-    headers: {
-      'User-Agent': UA,
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
+    headers: BROWSER_HEADERS,
     redirect: 'follow',
     signal: AbortSignal.timeout(30000),
   });
@@ -99,9 +119,12 @@ async function fetchImageBuffer(url: string): Promise<{ buffer: Buffer; contentT
   try {
     const res = await fetch(url, {
       headers: {
-        'User-Agent': UA,
-        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+        'User-Agent': BROWSER_HEADERS['User-Agent'],
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
         'Referer': 'https://www.geeksforgeeks.org/',
+        'Sec-Fetch-Dest': 'image',
+        'Sec-Fetch-Mode': 'no-cors',
+        'Sec-Fetch-Site': 'same-origin',
       },
       redirect: 'follow',
       signal: AbortSignal.timeout(20000),
@@ -117,7 +140,7 @@ async function fetchImageBuffer(url: string): Promise<{ buffer: Buffer; contentT
   }
 }
 
-// ─── Image Downloader (in-memory, no filesystem) ─────────────────────────
+// ─── Image Downloader: always transcode to PNG via sharp ───────────────────
 
 async function downloadAndProcessImage(url: string): Promise<ProcessedImage | null> {
   if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) return null;
@@ -125,163 +148,144 @@ async function downloadAndProcessImage(url: string): Promise<ProcessedImage | nu
   const result = await fetchImageBuffer(url);
   if (!result) return null;
 
-  const { buffer: rawBuf, contentType } = result;
-
-  // Determine extension from content-type
-  let ext = '.png';
-  if (contentType.includes('jpeg') || contentType.includes('jpg')) ext = '.jpg';
-  else if (contentType.includes('gif')) ext = '.gif';
-  else if (contentType.includes('webp')) ext = '.webp';
-  else if (contentType.includes('svg')) ext = '.svg';
-
-  // For PNG/JPG, try to get dimensions from buffer headers
-  let w = 580, h = 360;
   try {
-    const dims = getImageDimensions(rawBuf, ext);
-    if (dims) { w = dims.width; h = dims.height; }
-  } catch { /* use defaults */ }
+    // Use sharp to get real dimensions AND transcode to PNG in one pass
+    const pipeline = sharp(result.buffer);
+    const metadata = await pipeline.metadata();
+    const w = metadata.width || 580;
+    const h = metadata.height || 360;
 
-  // Simple scaling - if wider than max, calculate proportional height
-  // We keep the original buffer (no sharp on serverless) but store correct display dimensions
-  const displayW = w > MAX_IMG_W ? MAX_IMG_W : w;
-  const displayH = w > MAX_IMG_W ? Math.round(h * (MAX_IMG_W / w)) : h;
+    // Scale down if wider than max, preserving aspect ratio
+    let outW = w, outH = h;
+    if (outW > MAX_IMG_W) {
+      outW = MAX_IMG_W;
+      outH = Math.round(h * (MAX_IMG_W / w));
+    }
 
-  const hash = crypto.createHash('md5').update(url).digest('hex').substring(0, 12);
-  const fileName = `img_${hash}${ext === '.jpg' ? '.png' : ext}`;
-  // Convert to PNG for docx compatibility (docx prefers PNG/JPG)
-  let finalBuffer = rawBuf;
-  let finalExt = ext;
+    const pngBuf = await pipeline
+      .resize(outW, outH, { withoutEnlargement: true, fit: 'inside' })
+      .png({ quality: 90 })
+      .toBuffer();
 
-  // If it's a webp or gif, we'll just store as-is with png extension
-  // docx library handles most image formats
-  if (ext === '.webp' || ext === '.gif' || ext === '.svg') {
-    finalExt = '.png';
-    finalBuffer = rawBuf; // store raw, docx will try to embed
+    const hash = crypto.createHash('md5').update(url).digest('hex').substring(0, 12);
+    const fileName = `img_${hash}.png`;
+
+    return {
+      buffer: pngBuf,
+      ext: '.png',
+      width: outW,
+      height: outH,
+      localPath: fileName,
+      fileName,
+    };
+  } catch (err) {
+    // sharp failed — try raw embed as last resort
+    const hash = crypto.createHash('md5').update(url).digest('hex').substring(0, 12);
+    const fileName = `img_${hash}.png`;
+    return {
+      buffer: result.buffer,
+      ext: '.png',
+      width: 580,
+      height: 360,
+      localPath: fileName,
+      fileName,
+    };
   }
-  if (ext === '.jpg') {
-    finalExt = '.jpg';
-    finalBuffer = rawBuf;
-  }
-
-  return {
-    buffer: finalBuffer,
-    ext: finalExt,
-    width: displayW,
-    height: displayH,
-    localPath: fileName,
-    fileName,
-  };
 }
 
-// Simple image dimension reader from buffer headers (no sharp needed)
-function getImageDimensions(buf: Buffer, ext: string): { width: number; height: number } | null {
+// ─── LaTeX → PNG image via KaTeX + sharp ──────────────────────────────────
+
+async function latexToPngImage(latex: string): Promise<Buffer | null> {
   try {
-    if (ext === '.png' || (buf[0] === 0x89 && buf[1] === 0x50)) {
-      // PNG: width at offset 16 (4 bytes BE), height at offset 20
-      if (buf.length >= 24) {
-        const w = buf.readUInt32BE(16);
-        const h = buf.readUInt32BE(20);
-        if (w > 0 && h > 0 && w < 10000 && h < 10000) return { width: w, height: h };
-      }
-    }
-    if (ext === '.jpg' || (buf[0] === 0xFF && buf[1] === 0xD8)) {
-      // JPEG: parse SOF markers
-      let offset = 2;
-      while (offset < buf.length - 1) {
-        if (buf[offset] !== 0xFF) break;
-        const marker = buf[offset + 1];
-        if (marker === 0xC0 || marker === 0xC2) {
-          // SOF0 or SOF2
-          if (offset + 9 < buf.length) {
-            const h = buf.readUInt16BE(offset + 5);
-            const w = buf.readUInt16BE(offset + 7);
-            if (w > 0 && h > 0) return { width: w, height: h };
-          }
-        }
-        if (marker === 0xD8 || marker === 0xD9) { offset += 2; continue; }
-        if (marker === 0x00) { offset += 1; continue; }
-        if (offset + 3 < buf.length) {
-          const segLen = buf.readUInt16BE(offset + 2);
-          offset += 2 + segLen;
-        } else break;
-      }
-    }
-    if (ext === '.gif' || (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46)) {
-      // GIF: width at 6, height at 8 (2 bytes LE each)
-      if (buf.length >= 10) {
-        const w = buf.readUInt16LE(6);
-        const h = buf.readUInt16LE(8);
-        if (w > 0 && h > 0) return { width: w, height: h };
-      }
-    }
-  } catch { /* ignore */ }
-  return null;
+    // Render LaTeX to HTML via KaTeX
+    const html = katex.renderToString(latex, {
+      displayMode: true,
+      throwOnError: false,
+      output: 'html',
+    });
+
+    // Wrap in a basic HTML page for rendering
+    const fullHtml = `<!DOCTYPE html>
+<html><head><style>
+body { margin: 20px; padding: 10px; background: white; display: inline-block; font-size: 20px; }
+.katex { font-size: 1.2em; }
+</style>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/katex.min.css">
+</head><body>${html}</body></html>`;
+
+    // Since we can't use a browser on serverless, fall back to Unicode text rendering
+    // We'll render as a styled text image using sharp's SVG text capability
+    const unicodeText = renderLatexToUnicode(latex);
+    const svgText = unicodeText
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+    // Estimate dimensions based on text length
+    const charWidth = 12;
+    const textWidth = Math.max(unicodeText.length * charWidth + 40, 100);
+    const svgHeight = 50;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${textWidth}" height="${svgHeight}">
+      <rect width="100%" height="100%" fill="white"/>
+      <text x="20" y="32" font-family="Cambria Math, STIXGeneral, serif" font-size="20" font-style="italic" fill="#1a1a2e">${svgText}</text>
+    </svg>`;
+
+    const pngBuf = await sharp(Buffer.from(svg)).resize(textWidth, svgHeight).png().toBuffer();
+    return pngBuf;
+  } catch {
+    return null;
+  }
 }
 
-// ─── LaTeX → Rich Unicode Text ─────────────────────────────────────────────
+// ─── LaTeX → Unicode (fallback, used by SVG renderer and as text backup) ───
 
-function renderLatex(latex: string): string {
+function renderLatexToUnicode(latex: string): string {
   let t = latex
-    // Fractions
     .replace(/\\frac\{([^}]*)\}\{([^}]*)\}/g, '($1)/($2)')
-    // Roots
-    .replace(/\\sqrt\[(\d+)\]\{([^}]*)\}/g, '\u221A[$1]($2)')
-    .replace(/\\sqrt\{([^}]*)\}/g, '\u221A($1)')
-    // Big operators
-    .replace(/\\sum_?\{?([^}]*)\}?\^?\{?([^}]*)\}?/g, '\u2211')
-    .replace(/\\prod_?\{?([^}]*)\}?\^?\{?([^}]*)\}?/g, '\u220F')
-    .replace(/\\int_?\{?([^}]*)\}?\^?\{?([^}]*)\}?/g, '\u222B')
-    .replace(/\\iint/g, '\u222C')
-    .replace(/\\iiint/g, '\u222D')
-    .replace(/\\oint/g, '\u222E')
-    .replace(/\\partial/g, '\u2202')
-    .replace(/\\nabla/g, '\u2207')
-    // Greek lowercase
-    .replace(/\\alpha/g, '\u03B1').replace(/\\beta/g, '\u03B2').replace(/\\gamma/g, '\u03B3')
-    .replace(/\\delta/g, '\u03B4').replace(/\\epsilon/g, '\u03B5').replace(/\\varepsilon/g, '\u03B5')
-    .replace(/\\zeta/g, '\u03B6').replace(/\\eta/g, '\u03B7').replace(/\\theta/g, '\u03B8')
-    .replace(/\\vartheta/g, '\u03D1').replace(/\\iota/g, '\u03B9').replace(/\\kappa/g, '\u03BA')
-    .replace(/\\lambda/g, '\u03BB').replace(/\\mu/g, '\u03BC').replace(/\\nu/g, '\u03BD')
-    .replace(/\\xi/g, '\u03BE').replace(/\\pi/g, '\u03C0').replace(/\\varpi/g, '\u03D6')
-    .replace(/\\rho/g, '\u03C1').replace(/\\sigma/g, '\u03C3').replace(/\\tau/g, '\u03C4')
-    .replace(/\\upsilon/g, '\u03C5').replace(/\\phi/g, '\u03C6').replace(/\\varphi/g, '\u03C6')
-    .replace(/\\chi/g, '\u03C7').replace(/\\psi/g, '\u03C8').replace(/\\omega/g, '\u03C9')
-    // Greek uppercase
-    .replace(/\\Gamma/g, '\u0393').replace(/\\Delta/g, '\u0394').replace(/\\Theta/g, '\u0398')
-    .replace(/\\Lambda/g, '\u039B').replace(/\\Xi/g, '\u039E').replace(/\\Pi/g, '\u03A0')
-    .replace(/\\Sigma/g, '\u03A3').replace(/\\Upsilon/g, '\u03A5').replace(/\\Phi/g, '\u03A6')
-    .replace(/\\Psi/g, '\u03A8').replace(/\\Omega/g, '\u03A9')
-    // Relations
-    .replace(/\\leq/g, '\u2264').replace(/\\geq/g, '\u2265').replace(/\\neq/g, '\u2260')
-    .replace(/\\approx/g, '\u2248').replace(/\\equiv/g, '\u2261').replace(/\\sim/g, '\u223C')
-    .replace(/\\simeq/g, '\u2243').replace(/\\propto/g, '\u221D').replace(/\\cong/g, '\u2245')
-    .replace(/\\ll/g, '\u226A').replace(/\\gg/g, '\u226B').replace(/\\prec/g, '\u227A')
-    .replace(/\\succ/g, '\u227B').replace(/\\perp/g, '\u27C2').replace(/\\parallel/g, '\u2225')
-    // Operators
-    .replace(/\\times/g, '\u00D7').replace(/\\div/g, '\u00F7').replace(/\\pm/g, '\u00B1')
-    .replace(/\\mp/g, '\u2213').replace(/\\cdot/g, '\u00B7').replace(/\\cdots/g, '\u22EF')
-    .replace(/\\ldots/g, '\u2026').replace(/\\vdots/g, '\u22EE').replace(/\\ddots/g, '\u22F1')
-    .replace(/\\oplus/g, '\u2295').replace(/\\otimes/g, '\u2297').replace(/\\cap/g, '\u2229')
-    .replace(/\\cup/g, '\u222A').replace(/\\setminus/g, '\u2216').replace(/\\emptyset/g, '\u2205')
-    .replace(/\\in/g, '\u2208').replace(/\\notin/g, '\u2209').replace(/\\subset/g, '\u2282')
-    .replace(/\\supset/g, '\u2283').replace(/\\subseteq/g, '\u2286').replace(/\\supseteq/g, '\u2287')
-    .replace(/\\intersection/g, '\u2229').replace(/\\union/g, '\u222A')
-    // Arrows
-    .replace(/\\rightarrow/g, '\u2192').replace(/\\leftarrow/g, '\u2190').replace(/\\leftrightarrow/g, '\u2194')
-    .replace(/\\Rightarrow/g, '\u21D2').replace(/\\Leftarrow/g, '\u21D0').replace(/\\Leftrightarrow/g, '\u21D4')
-    .replace(/\\uparrow/g, '\u2191').replace(/\\downarrow/g, '\u2193').replace(/\\mapsto/g, '\u21A6')
-    .replace(/\\to/g, '\u2192').replace(/\\gets/g, '\u2190')
-    .replace(/\\implies/g, '\u21D2').replace(/\\iff/g, '\u21D4')
-    // Logic
-    .replace(/\\forall/g, '\u2200').replace(/\\exists/g, '\u2203').replace(/\\neg/g, '\u00AC')
-    .replace(/\\vee/g, '\u2228').replace(/\\wedge/g, '\u2227').replace(/\\therefore/g, '\u2234')
-    .replace(/\\because/g, '\u2235')
-    // Misc
-    .replace(/\\infty/g, '\u221E').replace(/\\aleph/g, '\u2135').replace(/\\Re/g, '\u211C')
-    .replace(/\\Im/g, '\u2111').replace(/\\wp/g, '\u2118').replace(/\\ell/g, '\u2113')
-    .replace(/\\hbar/g, '\u210F').replace(/\\angle/g, '\u2220').replace(/\\deg/g, '\u00B0')
-    .replace(/\\prime/g, '\u2032').replace(/\\backslash/g, '\\')
-    // Functions
+    .replace(/\\sqrt\[(\d+)\]\{([^}]*)\}/g, '√[$1]($2)')
+    .replace(/\\sqrt\{([^}]*)\}/g, '√($1)')
+    .replace(/\\sum_?\{?([^}]*)\}?\^?\{?([^}]*)\}?/g, '∑')
+    .replace(/\\prod_?\{?([^}]*)\}?\^?\{?([^}]*)\}?/g, '∏')
+    .replace(/\\int_?\{?([^}]*)\}?\^?\{?([^}]*)\}?/g, '∫')
+    .replace(/\\iint/g, '∬').replace(/\\iiint/g, '∭').replace(/\\oint/g, '∮')
+    .replace(/\\partial/g, '∂').replace(/\\nabla/g, '∇')
+    .replace(/\\alpha/g, 'α').replace(/\\beta/g, 'β').replace(/\\gamma/g, 'γ')
+    .replace(/\\delta/g, 'δ').replace(/\\epsilon/g, 'ε').replace(/\\varepsilon/g, 'ε')
+    .replace(/\\zeta/g, 'ζ').replace(/\\eta/g, 'η').replace(/\\theta/g, 'θ')
+    .replace(/\\vartheta/g, 'ϑ').replace(/\\iota/g, 'ι').replace(/\\kappa/g, 'κ')
+    .replace(/\\lambda/g, 'λ').replace(/\\mu/g, 'μ').replace(/\\nu/g, 'ν')
+    .replace(/\\xi/g, 'ξ').replace(/\\pi/g, 'π').replace(/\\varpi/g, 'ϖ')
+    .replace(/\\rho/g, 'ρ').replace(/\\sigma/g, 'σ').replace(/\\tau/g, 'τ')
+    .replace(/\\upsilon/g, 'υ').replace(/\\phi/g, 'φ').replace(/\\varphi/g, 'ϕ')
+    .replace(/\\chi/g, 'χ').replace(/\\psi/g, 'ψ').replace(/\\omega/g, 'ω')
+    .replace(/\\Gamma/g, 'Γ').replace(/\\Delta/g, 'Δ').replace(/\\Theta/g, 'Θ')
+    .replace(/\\Lambda/g, 'Λ').replace(/\\Xi/g, 'Ξ').replace(/\\Pi/g, 'Π')
+    .replace(/\\Sigma/g, 'Σ').replace(/\\Upsilon/g, 'Υ').replace(/\\Phi/g, 'Φ')
+    .replace(/\\Psi/g, 'Ψ').replace(/\\Omega/g, 'Ω')
+    .replace(/\\leq/g, '≤').replace(/\\geq/g, '≥').replace(/\\neq/g, '≠')
+    .replace(/\\approx/g, '≈').replace(/\\equiv/g, '≡').replace(/\\sim/g, '∼')
+    .replace(/\\simeq/g, '≃').replace(/\\propto/g, '∝').replace(/\\cong/g, '≅')
+    .replace(/\\ll/g, '≪').replace(/\\gg/g, '≫').replace(/\\prec/g, '≺')
+    .replace(/\\succ/g, '≻').replace(/\\perp/g, '⊥').replace(/\\parallel/g, '∥')
+    .replace(/\\times/g, '×').replace(/\\div/g, '÷').replace(/\\pm/g, '±')
+    .replace(/\\mp/g, '∓').replace(/\\cdot/g, '·').replace(/\\cdots/g, '⋯')
+    .replace(/\\ldots/g, '…').replace(/\\vdots/g, '⋮').replace(/\\ddots/g, '⋱')
+    .replace(/\\oplus/g, '⊕').replace(/\\otimes/g, '⊗').replace(/\\cap/g, '∩')
+    .replace(/\\cup/g, '∪').replace(/\\setminus/g, '∖').replace(/\\emptyset/g, '∅')
+    .replace(/\\in/g, '∈').replace(/\\notin/g, '∉').replace(/\\subset/g, '⊂')
+    .replace(/\\supset/g, '⊃').replace(/\\subseteq/g, '⊆').replace(/\\supseteq/g, '⊇')
+    .replace(/\\rightarrow/g, '→').replace(/\\leftarrow/g, '←').replace(/\\leftrightarrow/g, '↔')
+    .replace(/\\Rightarrow/g, '⇒').replace(/\\Leftarrow/g, '⇐').replace(/\\Leftrightarrow/g, '⇔')
+    .replace(/\\uparrow/g, '↑').replace(/\\downarrow/g, '↓').replace(/\\mapsto/g, '↦')
+    .replace(/\\to/g, '→').replace(/\\gets/g, '←')
+    .replace(/\\implies/g, '⇒').replace(/\\iff/g, '⇔')
+    .replace(/\\forall/g, '∀').replace(/\\exists/g, '∃').replace(/\\neg/g, '¬')
+    .replace(/\\vee/g, '∨').replace(/\\wedge/g, '∧').replace(/\\therefore/g, '∴')
+    .replace(/\\because/g, '∵')
+    .replace(/\\infty/g, '∞').replace(/\\aleph/g, 'ℵ').replace(/\\Re/g, 'ℜ')
+    .replace(/\\Im/g, 'ℑ').replace(/\\wp/g, '℘').replace(/\\ell/g, 'ℓ')
+    .replace(/\\hbar/g, 'ℏ').replace(/\\angle/g, '∠').replace(/\\deg/g, '°')
+    .replace(/\\prime/g, '′').replace(/\\backslash/g, '\\')
     .replace(/\\log_/g, 'log').replace(/\\ln/g, 'ln').replace(/\\sin/g, 'sin')
     .replace(/\\cos/g, 'cos').replace(/\\tan/g, 'tan').replace(/\\cot/g, 'cot')
     .replace(/\\sec/g, 'sec').replace(/\\csc/g, 'csc').replace(/\\arcsin/g, 'arcsin')
@@ -292,7 +296,6 @@ function renderLatex(latex: string): string {
     .replace(/\\min/g, 'min').replace(/\\arg/g, 'arg').replace(/\\det/g, 'det')
     .replace(/\\exp/g, 'exp').replace(/\\dim/g, 'dim').replace(/\\ker/g, 'ker')
     .replace(/\\hom/g, 'hom').replace(/\\Pr/g, 'Pr').replace(/\\gcd/g, 'gcd')
-    // Text commands
     .replace(/\\text\{([^}]*)\}/g, '$1')
     .replace(/\\mathrm\{([^}]*)\}/g, '$1')
     .replace(/\\mathbf\{([^}]*)\}/g, '$1')
@@ -302,10 +305,8 @@ function renderLatex(latex: string): string {
     .replace(/\\textrm\{([^}]*)\}/g, '$1')
     .replace(/\\textit\{([^}]*)\}/g, '$1')
     .replace(/\\textbf\{([^}]*)\}/g, '$1')
-    // Superscripts/subscripts
     .replace(/\^{([^}]*)}/g, '^($1)')
     .replace(/_{([^}]*)}/g, '_($1)')
-    // Clean up
     .replace(/\\left/g, '').replace(/\\right/g, '')
     .replace(/\\big/g, '').replace(/\\Big/g, '').replace(/\\bigg/g, '').replace(/\\Bigg/g, '')
     .replace(/\\,/g, ' ').replace(/\\;/g, ' ').replace(/\\!/g, '').replace(/\\ /g, ' ')
@@ -319,72 +320,214 @@ function renderLatex(latex: string): string {
   return t;
 }
 
-export { renderLatex };
+export { renderLatexToUnicode };
+
+// ─── Inline rich-text parser ───────────────────────────────────────────────
+
+function parseInlineRuns(el: cheerio.Cheerio<cheerio.Element>, $: cheerio.CheerioAPI): InlineRun[] {
+  const runs: InlineRun[] = [];
+
+  el.contents().each((_idx, node) => {
+    if (node.type === 'text') {
+      const t = (node as cheerio.TextNode).data;
+      if (t) runs.push({ text: t });
+    } else if (node.type === 'tag') {
+      const tag = (node as cheerio.Element).tagName.toLowerCase();
+      const child = $(node);
+      const text = child.text() || '';
+
+      if (tag === 'br') {
+        runs.push({ text: '\n' });
+      } else if (tag === 'img') {
+        // inline images — skip here, handled by walker
+        return;
+      } else if (tag === 'a') {
+        const href = child.attr('href') || '';
+        const inner = parseInlineRuns(child, $);
+        if (inner.length > 0) {
+          for (const r of inner) r.link = href;
+          runs.push(...inner);
+        } else if (text.trim()) {
+          runs.push({ text, link: href });
+        }
+      } else if (['strong', 'b'].includes(tag)) {
+        const inner = parseInlineRuns(child, $);
+        if (inner.length > 0) {
+          for (const r of inner) r.bold = true;
+          runs.push(...inner);
+        } else if (text.trim()) {
+          runs.push({ text, bold: true });
+        }
+      } else if (['em', 'i'].includes(tag)) {
+        const inner = parseInlineRuns(child, $);
+        if (inner.length > 0) {
+          for (const r of inner) r.italics = true;
+          runs.push(...inner);
+        } else if (text.trim()) {
+          runs.push({ text, italics: true });
+        }
+      } else if (tag === 'code' || tag === 'tt') {
+        runs.push({ text, code: true });
+      } else if (tag === 'sub') {
+        runs.push({ text, italics: true });
+      } else if (tag === 'sup') {
+        runs.push({ text, italics: true });
+      } else {
+        // recurse into unknown containers (span, div inside p, etc.)
+        const inner = parseInlineRuns(child, $);
+        if (inner.length > 0) runs.push(...inner);
+        else if (text.trim()) runs.push({ text });
+      }
+    }
+  });
+
+  return runs;
+}
 
 // ─── Page Scraper ──────────────────────────────────────────────────────────
+
+// Extract article HTML from GFG's __NEXT_DATA__ (React SPA)
+function extractNextDataContent(html: string): { contentHtml: string; title: string; childLinks: string[] } | null {
+  const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  if (!match) return null;
+  try {
+    const data = JSON.parse(match[1]);
+    const props = data?.props?.pageProps;
+    if (!props) return null;
+
+    // Get article HTML from articleContentArray or post_content
+    let contentHtml = '';
+    const arr = props.articleContentArray;
+    if (Array.isArray(arr) && arr.length > 0 && typeof arr[0] === 'string' && arr[0].length > 100) {
+      contentHtml = arr.join('');
+    } else {
+      const postContent = props.postDataFromWriteApi?.post_content;
+      if (postContent && postContent.length > 100) contentHtml = postContent;
+    }
+
+    if (!contentHtml) return null;
+
+    const title = props.postTitle || '';
+
+    // Extract child links from the HTML
+    const $ = cheerio.load(contentHtml);
+    const baseUrl = new URL('https://www.geeksforgeeks.org');
+    const links: string[] = [];
+    const seen = new Set<string>();
+    $('a[href]').each((_i, el) => {
+      let href = $(el).attr('href') || '';
+      if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+      if (href.startsWith('//')) href = 'https:' + href;
+      else if (href.startsWith('/')) href = baseUrl.origin + href;
+      try {
+        const u = new URL(href);
+        if (u.hostname.includes('geeksforgeeks.org') && !seen.has(href)) {
+          seen.add(href);
+          const pathParts = u.pathname.split('/').filter(Boolean);
+          if (pathParts.length >= 2 &&
+              !href.match(/\/(courses|practice|company|explore|jobs|contribute|events|premium|login|register|users|profile)$/) &&
+              !href.match(/\.(jpg|jpeg|png|gif|svg|webp|css|js|zip|pdf)$/i)) {
+            links.push(href);
+          }
+        }
+      } catch { /* skip */ }
+    });
+
+    return { contentHtml, title, childLinks: links };
+  } catch { return null; }
+}
 
 export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEvent) => void): Promise<ScrapedPageData> {
   // ── Cross-reference check ──
   const existing = checkPage(url);
   if (existing && existing.topic !== topic) {
     emit({ type: 'xref_found', message: `Already scraped under "${existing.topic}": ${url}`, url, refTopic: existing.topic, refTitle: existing.title });
-    return {
-      url, title: existing.title, sections: [], images: [], formulas: [], childLinks: [],
-      isNew: false, existingTopics: [existing.topic],
-    };
+    return { url, title: existing.title, sections: [], images: [], formulas: [], childLinks: [], isNew: false, existingTopics: [existing.topic] };
   }
   if (existing && existing.topic === topic) {
-    return {
-      url, title: existing.title, sections: [], images: [], formulas: [], childLinks: [],
-      isNew: false, existingTopics: [topic],
-    };
+    return { url, title: existing.title, sections: [], images: [], formulas: [], childLinks: [], isNew: false, existingTopics: [topic] };
   }
 
   emit({ type: 'status', message: `Fetching: ${url}`, url });
 
-  const html = await fetchPageHtml(url);
-  const $ = cheerio.load(html);
+  const rawHtml = await fetchPageHtml(url);
+
+  // Try extracting from __NEXT_DATA__ first (GFG is a React SPA)
+  const nextData = extractNextDataContent(rawHtml);
+  const useExtracted = nextData && nextData.contentHtml.length > 200;
+  const $ = cheerio.load(useExtracted ? nextData.contentHtml : rawHtml);
+  const title = (useExtracted ? nextData.title : '') || $('h1').first().text().trim() || $('title').text().trim() || url.split('/').filter(Boolean).pop()?.replace(/[-_]/g, ' ') || 'Untitled';
 
   // Detect 404 / error pages
-  if ($('.error-page, .error404, .page-404, [class*="404"]').length > 0 ||
-      $('title').text().toLowerCase().includes('404') ||
-      $('h1').first().text().trim().toLowerCase().includes('404')) {
-    emit({ type: 'error', message: `404 Not Found: ${url}`, url });
-    return { url, title: '404 Not Found', sections: [], images: [], formulas: [], childLinks: [], isNew: true, existingTopics: [] };
+  if (!useExtracted) {
+    const pageTitle = $('title').text().toLowerCase();
+    const h1Text = $('h1').first().text().trim().toLowerCase();
+    if (pageTitle.includes('404') || pageTitle.includes('page not found') ||
+        h1Text.includes('404') || h1Text.includes('page is gone')) {
+      emit({ type: 'error', message: `404: ${url}`, url });
+      return { url, title: '404', sections: [], images: [], formulas: [], childLinks: [], isNew: true, existingTopics: [] };
+    }
   }
 
-  const title = $('h1').first().text().trim() || $('title').text().trim() || url.split('/').filter(Boolean).pop()?.replace(/[-_]/g, ' ') || 'Untitled';
+  if (!title || title.length < 2) {
+    emit({ type: 'error', message: `No content: ${url}`, url });
+    return { url, title: 'No content', sections: [], images: [], formulas: [], childLinks: [], isNew: true, existingTopics: [] };
+  }
+
+  // Per-page dedup (not global!)
+  const seen = new Set<string>();
+  const seenImg = new Set<string>();
+  const seenFormula = new Set<string>();
 
   const sections: ContentSection[] = [];
   const images: ProcessedImage[] = [];
   const formulas: string[] = [];
   let imageOrder = 0;
 
-  // Content area — broad selectors to catch GFG's various layouts
-  const contentArea = $(
-    'article .article-content, article .entry-content, .entry-content, article.content, ' +
-    'main article, main .content, #post-content, .post-content, ' +
-    '.article-body, .article--content, .content-body, div[itemprop="articleBody"], ' +
-    '.GeeksforGeeks_content, .gfg-content'
-  ).first();
-  const root = contentArea.length > 0 ? contentArea : $.root();
+  // When using extracted content, the root IS the content (no need to select sub-areas)
+  // When using raw HTML, find the content area
+  let root: cheerio.Cheerio<cheerio.Element>;
+  if (useExtracted) {
+    root = $.root();
+  } else {
+    const contentArea = $(
+      'article .article-content, article .entry-content, .entry-content, article.content, ' +
+      'main article, main .content, #post-content, .post-content, ' +
+      '.article-body, .article--content, .content-body, div[itemprop="articleBody"], ' +
+      '.GeeksforGeeks_content, .gfg-content'
+    ).first();
+    root = contentArea.length > 0 ? contentArea : $.root();
+  }
 
-  // Clone and clean — remove non-content elements
+  // Clone and clean
   const clone = root.clone();
   clone.find('script, style, nav, footer, header, .sidebar, .navigation, .breadcrumb, ' +
     '.share, .social, .comments, .related, .ad, .advertisement, .widget, .popup, .modal, ' +
     '.overlay, .cookie, .newsletter, .subscribe, .rating, .author, .meta, .tags, ' +
     '.table-of-content, .toc, #table-of-content, .sticky, .notification, ' +
-    '.course-banner, .courses-banner, [class*="recommend"], [class*="suggestion"]'
+    '.course-banner, .courses-banner, [class*="recommend"], [class*="suggestion"], ' +
+    '.nk-cookie-banner, .nk-top-bar'
   ).remove();
 
-  const seen = new Set<string>();
-  const seenImg = new Set<string>();
-  const seenFormula = new Set<string>();
-
-  // ── Carousel images ──
+  // ── Carousel images: handle <gfg-carousel> elements AND standard selectors ──
   const carouselImgs: { url: string; alt?: string }[] = [];
-  clone.find('.carousel-slide img, .slider img, .swiper-slide img, .slick-slide img, [class*="carousel"] img, [class*="slider"] img, .wp-block-image img, .featured-img img, .thumb-item img, [class*="course"] img').each((_i, el) => {
+  // GFG-specific <gfg-carousel-content> elements from NEXT_DATA
+  $('gfg-carousel-content').each((_i, el) => {
+    let src = $(el).attr('src') || '';
+    const alt = $(el).attr('alt') || undefined;
+    if (src && !src.startsWith('data:') && !seenImg.has(src)) {
+      if (src.startsWith('//')) src = 'https:' + src;
+      if (src.startsWith('/')) src = new URL(url).origin + src;
+      seenImg.add(src);
+      carouselImgs.push({ url: src, alt });
+    }
+  });
+  // Standard carousel selectors
+  clone.find('.carousel-slide img, .slider img, .swiper-slide img, .slick-slide img, ' +
+    '[class*="carousel"] img, [class*="slider"] img, .wp-block-image img, ' +
+    '.featured-img img, .thumb-item img, [class*="course"] img, ' +
+    '.gallery img, .gallery-item img, [data-slide] img'
+  ).each((_i, el) => {
     let src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src') || '';
     if (src && !src.startsWith('data:') && !seenImg.has(src)) {
       if (src.startsWith('//')) src = 'https:' + src;
@@ -397,20 +540,20 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
   if (carouselImgs.length > 0) {
     const downloaded: ProcessedImage[] = [];
     for (let i = 0; i < carouselImgs.length; i++) {
-      emit({ type: 'image_done', message: `Downloading carousel image ${i + 1}/${carouselImgs.length}`, url: carouselImgs[i].url });
+      emit({ type: 'image_done', message: `Carousel image ${i + 1}/${carouselImgs.length}`, url: carouselImgs[i].url });
       const img = await downloadAndProcessImage(carouselImgs[i].url);
       if (img) { downloaded.push({ ...img, alt: carouselImgs[i].alt }); imageOrder++; images.push(img); }
-      await new Promise(r => setTimeout(r, 250));
+      await new Promise(r => setTimeout(r, 300));
     }
-    if (downloaded.length > 0) sections.push({ type: 'carousel', content: 'Featured Images', images: downloaded });
+    if (downloaded.length > 0) sections.push({ type: 'carousel', content: '', images: downloaded });
   }
 
   // ── DOM walker (preserves document order) ──
   async function walk(el: cheerio.Cheerio<cheerio.Element>, depth = 0): Promise<void> {
-    if (depth > 20) return;
+    if (depth > 25) return;
     const tag = (el as any).prop('tagName')?.toLowerCase() || '';
 
-    // Formulas
+    // Formulas — render as PNG image via KaTeX + sharp
     if (el.hasClass('mathjax') || el.hasClass('MathJax') || el.hasClass('math-display') || el.hasClass('katex-display') ||
         tag === 'math' || el.attr('type')?.includes('math/tex')) {
       const raw = el.attr('type')?.includes('math/tex') ? (el.html() || '') : (el.find('annotation[encoding="application/x-tex"]').text() || el.text() || '');
@@ -418,7 +561,19 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
       if (clean.length > 2 && !seenFormula.has(clean)) {
         seenFormula.add(clean);
         formulas.push(clean);
-        sections.push({ type: 'formula', content: clean });
+        const pngBuf = await latexToPngImage(clean);
+        if (pngBuf) {
+          // get dimensions from the png
+          const meta = await sharp(pngBuf).metadata();
+          sections.push({
+            type: 'formula-image', content: clean,
+            imageData: pngBuf, imageExt: '.png',
+            imageWidth: meta.width || 300, imageHeight: meta.height || 50,
+          });
+        } else {
+          // Fallback to text
+          sections.push({ type: 'paragraph', content: renderLatexToUnicode(clean) });
+        }
       }
       return;
     }
@@ -426,16 +581,16 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
     // Headings
     if (/^h[1-6]$/.test(tag)) {
       const t = el.text().trim();
-      if (t.length > 1 && !seen.has(t)) { seen.add(t); sections.push({ type: 'heading', level: parseInt(tag[1]), content: t }); }
+      if (t.length > 1) { sections.push({ type: 'heading', level: parseInt(tag[1]), content: t }); }
       return;
     }
 
-    // Code
+    // Code blocks
     if (tag === 'pre' || el.hasClass('code-block') || el.hasClass('highlight') || el.hasClass('Syntax')) {
       const codeEl = el.find('code').first();
       const code = codeEl.length > 0 ? el.find('code').text() : el.text();
       const c = code.trim();
-      if (c.length > 1 && !seen.has(c)) { seen.add(c); sections.push({ type: 'code', content: c }); }
+      if (c.length > 1) sections.push({ type: 'code', content: c });
       return;
     }
 
@@ -447,10 +602,7 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
         $(row).find('th, td').each((_ci, cell) => cells.push($(cell).text().trim().replace(/\s+/g, ' ')));
         if (cells.length > 0) rows.push(cells);
       });
-      if (rows.length > 0) {
-        const key = rows.map(r => r.join('|')).join('\n');
-        if (!seen.has(key)) { seen.add(key); sections.push({ type: 'table', content: '', rows }); }
-      }
+      if (rows.length > 0) sections.push({ type: 'table', content: '', rows });
       return;
     }
 
@@ -458,22 +610,22 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
     if (tag === 'ul' || tag === 'ol') {
       const items: string[] = [];
       el.find('> li').each((_li, li) => { const t = $(li).text().trim().replace(/\s+/g, ' '); if (t.length > 0) items.push(t); });
-      if (items.length > 0) { const key = items.join('\n'); if (!seen.has(key)) { seen.add(key); sections.push({ type: 'list', content: '', items }); } }
+      if (items.length > 0) sections.push({ type: 'list', content: '', items });
       return;
     }
 
-    // Images
+    // Images (including lazy-loaded data-src)
     if (tag === 'img') {
-      let src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src') || '';
+      let src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src') || $(el).attr('data-original') || '';
       if (!src || src.startsWith('data:') || seenImg.has(src)) return;
       const w = parseInt($(el).attr('width') || '0'); const h = parseInt($(el).attr('height') || '0');
-      if ((w > 0 && w < 40) || (h > 0 && h < 40)) return;
+      if ((w > 0 && w < 30) || (h > 0 && h < 30)) return;
       if (src.includes('pixel') || src.includes('spacer') || src.includes('1x1')) return;
       if (src.startsWith('//')) src = 'https:' + src;
       if (src.startsWith('/')) src = new URL(url).origin + src;
       seenImg.add(src);
       imageOrder++;
-      emit({ type: 'image_done', message: `Downloading image ${imageOrder}`, url: src });
+      emit({ type: 'image_done', message: `Image ${imageOrder}`, url: src });
       const img = await downloadAndProcessImage(src);
       if (img) {
         images.push(img);
@@ -486,24 +638,47 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
     // HR
     if (tag === 'hr') { sections.push({ type: 'hr', content: '' }); return; }
 
-    // Paragraphs
+    // Paragraphs — extract INLINE rich text (bold, code, links, italic)
     if (tag === 'p') {
+      // Check for formula inside paragraph
       const formulaEl = el.find('.mathjax, .MathJax, .katex, math, script[type*="math/tex"]').first();
       if (formulaEl.length > 0) {
         const raw = formulaEl.attr('type')?.includes('math/tex') ? (formulaEl.html() || '') : (formulaEl.find('annotation[encoding="application/x-tex"]').text() || formulaEl.text() || '');
         const clean = raw.replace(/\s+/g, ' ').trim();
-        if (clean.length > 2 && !seenFormula.has(clean)) { seenFormula.add(clean); formulas.push(clean); sections.push({ type: 'formula', content: clean }); }
-        const surrounding = el.clone().find('.mathjax, .MathJax, .katex, math, script[type*="math/tex"]').remove().end().text().trim().replace(/\s+/g, ' ');
-        if (surrounding.length > 0 && !seen.has(surrounding)) { seen.add(surrounding); sections.push({ type: 'paragraph', content: surrounding }); }
+        if (clean.length > 2 && !seenFormula.has(clean)) {
+          seenFormula.add(clean);
+          formulas.push(clean);
+          const pngBuf = await latexToPngImage(clean);
+          if (pngBuf) {
+            const meta = await sharp(pngBuf).metadata();
+            sections.push({ type: 'formula-image', content: clean, imageData: pngBuf, imageExt: '.png', imageWidth: meta.width || 300, imageHeight: meta.height || 50 });
+          }
+        }
+        // Also get surrounding text
+        const surrounding = el.clone().find('.mathjax, .MathJax, .katex, math, script[type*="math/tex"]').remove().end();
+        const runs = parseInlineRuns(surrounding, $);
+        const textOnly = runs.map(r => r.text).join('').trim();
+        if (textOnly.length > 0) {
+          sections.push({ type: 'rich-paragraph', content: textOnly, runs });
+        }
       } else {
-        const t = el.text().trim().replace(/\s+/g, ' ');
-        if (t.length > 0 && !seen.has(t)) { seen.add(t); sections.push({ type: 'paragraph', content: t }); }
+        // Rich paragraph with inline formatting
+        const runs = parseInlineRuns(el, $);
+        const textOnly = runs.map(r => r.text).join('').trim();
+        if (textOnly.length > 0) {
+          const hasFormatting = runs.some(r => r.bold || r.italics || r.code || r.link);
+          if (hasFormatting) {
+            sections.push({ type: 'rich-paragraph', content: textOnly, runs });
+          } else {
+            sections.push({ type: 'paragraph', content: textOnly });
+          }
+        }
       }
       return;
     }
 
     // Recurse into containers
-    if (['div', 'section', 'article', 'main', 'span', 'figure', 'figcaption', 'aside', 'details', 'summary'].includes(tag)) {
+    if (['div', 'section', 'article', 'main', 'span', 'figure', 'figcaption', 'aside', 'details', 'summary', 'blockquote'].includes(tag)) {
       for (const child of el.children().toArray()) await walk($(child), depth + 1);
     }
   }
@@ -511,45 +686,50 @@ export async function scrapePage(url: string, topic: string, emit: (e: ScrapeEve
   for (const child of clone.children().toArray()) await walk($(child));
 
   // Fallback
-  if (sections.filter(s => s.type === 'heading' || s.type === 'paragraph').length === 0) {
+  if (sections.filter(s => s.type === 'heading' || s.type === 'paragraph' || s.type === 'rich-paragraph').length === 0) {
     const text = clone.text().replace(/\s+/g, ' ').trim();
     if (text.length > 10) {
       const paras = text.split(/\n\n|(?<=[.!?])\s+(?=[A-Z])/).filter(p => p.trim().length > 0);
-      for (const p of paras) if (!seen.has(p.trim())) { seen.add(p.trim()); sections.push({ type: 'paragraph', content: p.trim() }); }
+      for (const p of paras) sections.push({ type: 'paragraph', content: p.trim() });
     }
   }
 
-  // Child links
-  const baseUrl = new URL(url);
-  const childLinks: string[] = [];
-  const seenLinks = new Set<string>();
-  $('article a[href], .entry-content a[href], .article-content a[href], .related a[href], .sidebar a[href]').each((_i, el) => {
-    let href = $(el).attr('href') || '';
-    if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
-    if (href.startsWith('//')) href = 'https:' + href;
-    else if (href.startsWith('/')) href = baseUrl.origin + href;
-    try {
-      const linkUrl = new URL(href);
-      if (linkUrl.hostname.includes('geeksforgeeks.org') && !seenLinks.has(href) && href !== url) {
-        seenLinks.add(href);
-        const pathParts = linkUrl.pathname.split('/').filter(Boolean);
-        if (pathParts.length >= 2 && !href.match(/\/(courses|practice|company|explore|jobs|contribute|events|premium)$/) && !href.match(/\.(jpg|jpeg|png|gif|svg|webp|css|js)$/i)) {
-          childLinks.push(href);
+  // Child links — use pre-extracted links from NEXT_DATA if available
+  let childLinks: string[] = [];
+  if (useExtracted && nextData.childLinks.length > 0) {
+    childLinks = nextData.childLinks.filter(l => l !== url);
+  } else {
+    const baseUrl = new URL(url);
+    const seenLinks = new Set<string>();
+    $('article a[href], .entry-content a[href], .article-content a[href], .related a[href], .sidebar a[href], main a[href]').each((_i, el) => {
+      let href = $(el).attr('href') || '';
+      if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+      if (href.startsWith('//')) href = 'https:' + href;
+      else if (href.startsWith('/')) href = baseUrl.origin + href;
+      try {
+        const linkUrl = new URL(href);
+        if (linkUrl.hostname.includes('geeksforgeeks.org') && !seenLinks.has(href) && href !== url) {
+          seenLinks.add(href);
+          const pathParts = linkUrl.pathname.split('/').filter(Boolean);
+          if (pathParts.length >= 2 &&
+              !href.match(/\/(courses|practice|company|explore|jobs|contribute|events|premium|login|register|users|profile)$/)) {
+            if (!href.match(/\.(jpg|jpeg|png|gif|svg|webp|css|js|zip|pdf)$/i)) {
+              childLinks.push(href);
+            }
+          }
         }
-      }
-    } catch { /* skip */ }
-  });
-  // All child links included (no limit)
+      } catch { /* skip */ }
+    });
+  }
 
-  // Register in memory
   registerPage(url, title, topic);
 
-  emit({ type: 'page_done', message: `Completed: ${title} (${sections.length} sections, ${images.length} images, ${formulas.length} formulas)`, url });
+  emit({ type: 'page_done', message: `Done: ${title} (${sections.length} sections, ${images.length} images, ${formulas.length} formulas)`, url });
 
   return { url, title, sections, images, formulas, childLinks, isNew: true, existingTopics: [] };
 }
 
-// ─── Full Topic Scraper with Cross-Referencing ─────────────────────────────
+// ─── Full Topic Scraper ────────────────────────────────────────────────────
 
 export async function scrapeTopic(
   startUrl: string,
@@ -563,7 +743,7 @@ export async function scrapeTopic(
   const crossRefs: CrossRefEntry[] = [];
   const queue: { url: string; d: number }[] = [{ url: startUrl, d: 0 }];
 
-  emit({ type: 'status', message: `Starting topic: "${topic}" from ${startUrl}`, topic });
+  emit({ type: 'status', message: `Starting: "${topic}" from ${startUrl}`, topic });
 
   while (queue.length > 0) {
     const { url, d } = queue.shift()!;
@@ -578,9 +758,12 @@ export async function scrapeTopic(
         continue;
       }
 
+      // Skip empty/404 pages
+      if (page.sections.length === 0) continue;
+
       allPages.push(page);
 
-      // Queue child links (no depth limit - follows all links)
+      // Queue all child links — no depth limit
       for (const link of page.childLinks) {
         if (!visited.has(link)) {
           queue.push({ url: link, d: d + 1 });
@@ -591,10 +774,10 @@ export async function scrapeTopic(
       emit({ type: 'error', message: `Failed: ${url} - ${err.message}`, url });
     }
 
-    if (queue.length > 0) await new Promise(r => setTimeout(r, 1200));
+    if (queue.length > 0) await new Promise(r => setTimeout(r, 1500));
   }
 
-  emit({ type: 'topic_done', message: `Topic "${topic}" complete: ${allPages.length} new pages, ${crossRefs.length} cross-referenced`, topic, pagesScraped: allPages.length, pagesReferenced: crossRefs.length, imagesDownloaded: allPages.reduce((s, p) => s + p.images.length, 0) });
+  emit({ type: 'topic_done', message: `Topic "${topic}": ${allPages.length} pages, ${crossRefs.length} cross-referenced`, topic, pagesScraped: allPages.length, pagesReferenced: crossRefs.length, imagesDownloaded: allPages.reduce((s, p) => s + p.images.length, 0) });
 
   return { pages: allPages, crossRefs };
 }
