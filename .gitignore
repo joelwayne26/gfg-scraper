@@ -32,6 +32,8 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+.env.local
+.env.production
 
 # vercel
 .vercel
@@ -50,5 +52,24 @@ test
 prompt
 
 server.log
+
 # Skills directory
 /skills/
+
+# Mini-services (separate deployment)
+/mini-services/
+
+# Tool results
+/tool-results/
+
+# Database
+/db/
+*.db
+
+# Download output
+/download/
+
+# Z.ai internal
+.zscripts/
+worklog.md
+screenshot*.png
